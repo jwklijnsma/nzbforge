@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>API Key Manager</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 2rem auto; padding: 0 1rem; }
+        .key-display { background: #f0f0f0; padding: 1rem; border-radius: 4px; margin-top: 1rem; }
+        .copy-btn { margin-left: 0.5rem; background: #4CAF50; color: white; border: none; padding: 0.25rem 0.75rem; border-radius: 4px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>API Key Management</h1>
+    <button id="generateBtn">Generate New API Key</button>
+    <div id="keyDisplay" class="key-display" style="display: none;">
+        <p>Your API Key:</p>
+        <code id="apiKey"></code>
+        <button class="copy-btn" onclick="copyKey()">Copy</button>
+    </div>
+
+    <script>
+        document.getElementById('generateBtn').addEventListener('click', async () => {
+            try {
+                const response = await fetch('/api/generate-key', { method: 'POST' });
+                const data = await response.json();
+                document.getElementById('apiKey').textContent = data.api_key;
+                document.getElementById('keyDisplay').style.display = 'block';
+            } catch (error) {
+                alert('Failed to generate key');
+            }
+        });
+
+        function copyKey() {
+            const key = document.getElementById('apiKey').textContent;
+            navigator.clipboard.writeText(key)
+                .then(() => alert('API Key copied to clipboard!'));
+        }
+    </script>
+</body>
+</html>

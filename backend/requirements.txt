@@ -1,0 +1,5 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+sqlalchemy>=2.0
+# for Postgres instead of SQLite (recommended past ~100k releases):
+# psycopg[binary]>=3.1
