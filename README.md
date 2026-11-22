@@ -66,3 +66,6 @@ Behind a reverse proxy run uvicorn with `--proxy-headers` so NZB links get the r
 - Categories come from name heuristics only. No TVDB/TMDB/IMDB matching, so `tvdbid`/`imdbid` params are ignored (Sonarr/Radarr fall back to text `q`).
 - No NFO/PAR2 inspection, passworded-release detection, or release de-duplication across groups.
 - Check your Usenet provider's terms before bulk-scanning headers.
+
+> **API Key UI Note**: The API key management interface shows a "Generate New API Key" button. When clicked, it displays a secure 64-character hex key with a "Copy" button for easy clipboard access. The interface uses a clean, minimal design with light background styling.
+> **Note**: Please add the screenshot image to `screenshots/api_key_ui_screenshot.png` to display the UI image.
