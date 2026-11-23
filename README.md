@@ -69,6 +69,18 @@ plus `python -m app.scanner`.
 2. When a collection is complete (or >= MIN_COMPLETION and idle 2h) it becomes a `Release`, classified into Newznab categories with season/episode parsed from the name.
 3. `/api?t=get` builds the NZB on the fly from the stored message-ids.
 
+## Pulling groups (Admin tab)
+![Pull progress](docs/img/pulling.png)
+
+- **Pull all groups now** wakes the scanner instead of waiting for `SCAN_INTERVAL`; **Pull** on a row pulls just that group.
+  While a pull runs you see the current group, a bar for its headers and one for all groups; a small progress pill in the
+  top bar shows it from any page.
+- **Import all from provider** runs in the background (pattern + minimum articles) with its own progress.
+- Per group: on/off (only active groups are pulled automatically), headers still to pull, last pulled, last error,
+  and Remove. Filter by name or show only active / off / groups with errors.
+- API: `POST /web/pull` `{"groups": [...]}` (empty = all active), `GET /web/jobs` (live status),
+  `PATCH/DELETE /web/groups/{name}`, `POST /web/groups/import` (now returns 202 and runs in the background).
+
 ## Spotweb-style interface
 ![Spot list](docs/img/spots.png)
 

@@ -36,6 +36,38 @@ EXPIRE_DAYS = int(os.getenv("EXPIRE_DAYS", "3"))
 NFO_PER_PASS = int(os.getenv("NFO_PER_PASS", "100"))
 
 
+# ---------- live job status (read by GET /web/jobs) ----------
+_lock = threading.Lock()
+STATUS = {
+    "scanner": {"state": "idle", "group": None, "group_index": 0, "group_count": 0,
+                "article": 0, "article_from": 0, "article_to": 0, "headers": 0,
+                "started": None, "next_run": None, "last_pass": None, "queued": []},
+    "import": {"state": "idle", "pattern": None, "matched": 0, "added": 0, "error": None,
+               "started": None, "finished": None},
+}
+_wake = threading.Event()        # set to start the next pass now
+_requested: set[str] = set()     # groups asked for via "pull now" (empty = all active groups)
+_pass_lock = threading.Lock()    # one scan pass at a time
+_loop_running = False
+
+
+def _iso(dt):
+    return dt.isoformat() + "Z" if dt else None
+
+
+def _set(job, **kw):
+    with _lock:
+        STATUS[job].update(kw)
+
+
+def status() -> dict:
+    with _lock:
+        snap = {k: dict(v) for k, v in STATUS.items()}
+    snap["scanner"]["queued"] = sorted(_requested)
+    snap["scanner"]["enabled"] = _loop_running
+    return snap
+
+
 class NNTP:
     """Minimal NNTP client (nntplib was removed in Python 3.13)."""
 
@@ -220,6 +252,7 @@ def finalize(db):
             dropped += 1
     db.commit()
     log.info("finalize: %d releases created, %d expired", made, dropped)
+    return made
 
 
 def yenc_decode(lines):
@@ -282,8 +315,11 @@ def import_groups(db, nntp, pattern="alt.binaries.*", min_articles=1):
         if flag.startswith(("=", "x")) or last - first + 1 < min_articles:
             continue  # aliases, removed groups, (almost) empty groups
         matched += 1
+        with _lock:
+            STATUS["import"]["matched"] = matched
+            STATUS["import"]["added"] = added
         if name not in have:
-            db.add(Group(name=name))
+            db.add(Group(name=name, server_first=first, server_last=last))
             have.add(name)
             added += 1
     db.commit()
@@ -292,46 +328,157 @@ def import_groups(db, nntp, pattern="alt.binaries.*", min_articles=1):
 
 def scan_group(nntp, db, g):
     first, last = nntp.group(g.name)
+    g.server_first, g.server_last, g.last_error = first, last, None
     if last < first or last == 0:
-        return  # empty group
+        g.scanned_at = datetime.utcnow()
+        db.commit()
+        return 0  # empty group
     if g.last_article > last:  # provider reset numbering
         g.last_article = 0
     a = g.last_article + 1 if g.last_article else max(first, last - INITIAL)
+    _set("scanner", article_from=a, article_to=last, article=a - 1)
+    headers = 0
     while a <= last:
         b = min(a + BATCH - 1, last)
-        ingest(db, g, nntp.xover(a, b))
+        lines = nntp.xover(a, b)
+        ingest(db, g, lines)
+        headers += len(lines)
         g.last_article = b
         db.commit()
+        with _lock:
+            STATUS["scanner"]["article"] = b
+            STATUS["scanner"]["headers"] += len(lines)
         log.info("%s: %d/%d", g.name, b, last)
         a = b + 1
+    g.scanned_at = datetime.utcnow()
+    db.commit()
+    return headers
 
 
-def scan_pass():
-    nntp = NNTP(HOST, PORT, USER, PASS, USE_SSL)
+def scan_pass(only=None):
+    """One pass over all active groups (or just the names in `only`), then build/enrich releases."""
+    if not _pass_lock.acquire(blocking=False):
+        return False  # a pass is already running; its caller will see the queued request
+    t0 = datetime.utcnow()
+    summary = {"groups": 0, "headers": 0, "releases": 0, "errors": [], "only": sorted(only) if only else None}
+    _set("scanner", state="connecting", started=_iso(t0), headers=0, group=None, group_index=0, group_count=0,
+         article=0, article_from=0, article_to=0, next_run=None)
     try:
-        with SessionLocal() as db:
-            for g in db.scalars(select(Group).where(Group.active)).all():
-                try:
-                    scan_group(nntp, db, g)
-                except RuntimeError as e:  # NNTP error for this group only; keep going
-                    db.rollback()
-                    log.warning("%s: skipped (%s)", g.name, e)
-            finalize(db)
-            tag_pending(db)
-            enrich_pending(db)
-            fetch_nfos(nntp, db)
+        nntp = NNTP(HOST, PORT, USER, PASS, USE_SSL)
+        try:
+            with SessionLocal() as db:
+                q = select(Group).order_by(Group.name)
+                q = q.where(Group.name.in_(only)) if only else q.where(Group.active)
+                groups = db.scalars(q).all()
+                for i, g in enumerate(groups, 1):
+                    _set("scanner", state="scanning", group=g.name, group_index=i, group_count=len(groups),
+                         article=0, article_from=0, article_to=0)
+                    try:
+                        summary["headers"] += scan_group(nntp, db, g)
+                        summary["groups"] += 1
+                    except RuntimeError as e:  # NNTP error for this group only; keep going
+                        db.rollback()
+                        g.last_error = str(e)[:255]
+                        db.commit()
+                        summary["errors"].append(f"{g.name}: {e}")
+                        log.warning("%s: skipped (%s)", g.name, e)
+                    with _lock:
+                        _requested.discard(g.name)
+                _set("scanner", state="building releases", group=None)
+                summary["releases"] = finalize(db) or 0
+                tag_pending(db)
+                _set("scanner", state="looking up metadata")
+                enrich_pending(db)
+                _set("scanner", state="fetching NFOs")
+                fetch_nfos(nntp, db)
+        finally:
+            nntp.close()
+    except Exception as e:
+        summary["errors"].append(str(e))
+        raise
     finally:
-        nntp.close()
+        summary["finished"] = _iso(datetime.utcnow())
+        summary["seconds"] = round((datetime.utcnow() - t0).total_seconds())
+        _set("scanner", state="idle", group=None, last_pass=summary)
+        _pass_lock.release()
+    return True
 
 
 def run(stop: threading.Event | None = None):
+    global _loop_running
     stop = stop or threading.Event()
-    while not stop.is_set():
+    _loop_running = True
+    try:
+        while not stop.is_set():
+            with _lock:
+                only = set(_requested)
+            try:
+                scan_pass(only) if only else scan_pass()
+            except Exception:
+                log.exception("scan pass failed")
+            if stop.is_set():
+                break
+            with _lock:
+                pending = bool(_requested)
+            if not pending:
+                _set("scanner", state="waiting", next_run=_iso(datetime.utcnow() + timedelta(seconds=INTERVAL)))
+                _wake.wait(INTERVAL)
+            _wake.clear()
+    finally:
+        _loop_running = False
+
+
+def request_pull(groups=None):
+    """'Pull now' from the UI: wake the loop (or run a one-off pass when the loop is off)."""
+    if groups:
+        with _lock:
+            _requested.update(groups)
+    if _loop_running:
+        _wake.set()
+        return
+    if _pass_lock.locked():
+        return  # one-off pass already running; requested groups are picked up next time
+
+    def once():
+        with _lock:
+            only = set(_requested)
         try:
-            scan_pass()
+            scan_pass(only) if only else scan_pass()
         except Exception:
             log.exception("scan pass failed")
-        stop.wait(INTERVAL)
+
+    threading.Thread(target=once, name="scanner-once", daemon=True).start()
+
+
+def start_import(pattern="alt.binaries.*", min_articles=1):
+    """Run import_groups() in the background; progress in STATUS['import']."""
+    with _lock:
+        if STATUS["import"]["state"] == "running":
+            return False
+        STATUS["import"].update(state="running", pattern=pattern, matched=0, added=0, error=None,
+                                started=_iso(datetime.utcnow()), finished=None)
+
+    def job():
+        try:
+            nntp = NNTP(HOST, PORT, USER, PASS, USE_SSL)
+            try:
+                with SessionLocal() as db:
+                    added, matched = import_groups(db, nntp, pattern, min_articles)
+            finally:
+                nntp.close()
+            _set("import", state="done", added=added, matched=matched)
+        except Exception as e:
+            log.warning("group import failed: %s", e)
+            _set("import", state="failed", error=str(e))
+        finally:
+            _set("import", finished=_iso(datetime.utcnow()))
+
+    threading.Thread(target=job, name="group-import", daemon=True).start()
+    return True
+
+
+def wake():
+    _wake.set()
 
 
 def enabled() -> bool:

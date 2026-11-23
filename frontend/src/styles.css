@@ -159,3 +159,49 @@ table.files { width: 100%; border-collapse: collapse; }
   .c-date, .spots th:nth-child(5) { display: none; }
   .spot { flex-direction: column; }
 }
+
+/* ---- background jobs: top bar pill, progress bars ---- */
+.jobpill { display: inline-flex; align-items: center; gap: 7px; border: 0; border-radius: 12px; padding: 4px 11px; background: rgba(255,255,255,.16); color: var(--bar-ink); font-size: 12px; white-space: nowrap; }
+.jobpill:hover { background: rgba(255,255,255,.26); }
+.spin { width: 10px; height: 10px; border-radius: 50%; border: 2px solid currentColor; border-right-color: transparent; animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.bar { height: 8px; background: var(--zebra); border: 1px solid var(--line); border-radius: 5px; overflow: hidden; margin: 4px 0; position: relative; }
+.bar span { display: block; height: 100%; background: var(--accent); border-radius: 5px; transition: width .6s ease; }
+.bar.indeterminate span { position: absolute; width: 30%; animation: slide 1.3s ease-in-out infinite; }
+@keyframes slide { from { left: -30%; } to { left: 100%; } }
+@media (prefers-reduced-motion: reduce) { .spin, .bar.indeterminate span { animation: none; } .bar.indeterminate span { width: 100%; opacity: .35; } }
+
+/* ---- admin ---- */
+.admin p { margin: 4px 0; }
+.small { font-size: 11px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 14px; margin: 12px 0 22px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; }
+.card h3, .grouphead h3 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.cardhead { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.cardhead h3 { margin: 0; }
+.card button, .acts button { border: 0; border-radius: 4px; padding: 6px 12px; background: var(--accent); color: #fff; white-space: nowrap; }
+.card button:disabled, .acts button:disabled { opacity: .55; cursor: default; }
+.card .row { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
+.card .row > input { flex: 1 1 180px; }
+.minart { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+.minart input { width: 96px; }
+.lastpass { margin-top: 10px !important; padding-top: 8px; border-top: 1px solid var(--line); }
+button.link.bad, .error.small { color: var(--err); }
+.errs { margin: 6px 0 0; padding-left: 18px; max-height: 160px; overflow: auto; color: var(--err); font-size: 12px; }
+.grouphead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.grouphead h3 { margin: 0; }
+.grouphead input { flex: 0 1 260px; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+.seg button { border: 0; background: var(--panel); color: var(--ink); padding: 5px 10px; border-right: 1px solid var(--line); }
+.seg button:last-child { border-right: 0; }
+.seg button.on { background: var(--accent); color: #fff; }
+table.groups td { vertical-align: middle; }
+.groups td.num, .groups th:nth-child(3), .groups th:nth-child(4), .groups th:nth-child(5) { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.groups td.num .bar { display: inline-block; width: 80px; vertical-align: middle; margin: 0 6px 0 0; }
+.groups tr.off td { color: var(--muted); }
+.groups tr.pulling td { background: var(--sel); }
+.groups td.acts { text-align: right; white-space: nowrap; }
+.acts button.small, .card button.small { font-size: 11px; padding: 3px 9px; }
+.acts button.ghost { background: none; color: var(--err); border: 1px solid var(--line); margin-left: 4px; }
+@media (prefers-color-scheme: dark) { .card button, .acts button:not(.ghost), .seg button.on { color: #0d1620; } }
+@media (max-width: 700px) { .groups th:nth-child(3), .groups td:nth-child(3), .groups th:nth-child(4), .groups td:nth-child(4) { display: none; } .jobpill { order: 2; } }

@@ -1,4 +1,5 @@
 import io
+import time
 
 from conftest import ADMIN_KEY
 
@@ -62,7 +63,13 @@ def test_import_endpoint(client, monkeypatch):
     monkeypatch.setattr(scanner, "HOST", "news.example.com")
     monkeypatch.setattr(scanner, "NNTP", lambda *a: fake_nntp(["alt.binaries.new.one 99 1 y"]))
     r = client.post("/web/groups/import", json={"pattern": "alt.binaries.new.*"}, headers=h)
-    assert r.json() == {"matched": 1, "added": 1}
+    assert r.status_code == 202 and r.json()["state"] == "running"
+    for _ in range(50):
+        job = client.get("/web/jobs", headers=h).json()["import"]
+        if job["state"] != "running":
+            break
+        time.sleep(0.05)
+    assert (job["state"], job["matched"], job["added"]) == ("done", 1, 1)
 
 
 def test_bad_group_does_not_stop_pass(monkeypatch):
@@ -72,6 +79,7 @@ def test_bad_group_does_not_stop_pass(monkeypatch):
         scanned.append(g.name)
         if len(scanned) == 1:
             raise RuntimeError("GROUP x: 411 no such group")
+        return 5
 
     class N:
         def close(self):
@@ -84,3 +92,6 @@ def test_bad_group_does_not_stop_pass(monkeypatch):
     monkeypatch.setattr(scanner, "fetch_nfos", lambda nntp, db: None)
     scanner.scan_pass()
     assert len(scanned) >= 2
+    last = scanner.status()["scanner"]["last_pass"]
+    assert last["errors"] and "411" in last["errors"][0] and last["headers"] == 5 * (len(scanned) - 1)
+    assert scanner.status()["scanner"]["state"] == "idle"

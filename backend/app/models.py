@@ -18,6 +18,10 @@ class Group(Base):
     name: Mapped[str] = mapped_column(String(255), unique=True)
     last_article: Mapped[int] = mapped_column(BigInteger, default=0)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    server_first: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # from the last GROUP reply
+    server_last: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    scanned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class Collection(Base):
