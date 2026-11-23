@@ -1,0 +1,27 @@
+# nzbforge web: Newznab API (/api) + React UI on port 8000
+[Unit]
+Description=nzbforge web (API + UI)
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+ContainerName=nzbforge
+Image=ghcr.io/jwklijnsma/nzbforge:latest
+AutoUpdate=registry
+Network=nzbforge.network
+Volume=nzbforge-data.volume:/data:Z
+EnvironmentFile=%h/.config/nzbforge/nzbforge.env
+PublishPort=8000:8000
+HealthCmd=python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api?t=caps', timeout=5)"
+HealthInterval=60s
+HealthStartPeriod=20s
+HealthOnFailure=kill
+NoNewPrivileges=true
+
+[Service]
+Restart=always
+RestartSec=10
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target
