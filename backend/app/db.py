@@ -5,7 +5,8 @@ from sqlalchemy.orm import sessionmaker, DeclarativeBase
 URL = os.getenv("DATABASE_URL", "sqlite:///./nzbforge.db")
 engine = create_engine(
     URL,
-    connect_args={"check_same_thread": False} if URL.startswith("sqlite") else {},
+    # timeout: web requests and the scanner thread share the SQLite file
+    connect_args={"check_same_thread": False, "timeout": 30} if URL.startswith("sqlite") else {},
     pool_pre_ping=True,
 )
 SessionLocal = sessionmaker(engine, expire_on_commit=False)

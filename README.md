@@ -11,25 +11,24 @@ pip install -r requirements.txt
 cp .env.example .env && set -a && source .env && set +a
 
 python -m app.cli add-group alt.binaries.example         # groups your provider carries
-uvicorn app.main:app --host 0.0.0.0 --port 8000          # API + UI (first start prints/creates the admin key)
-python -m app.scanner                                    # second process: header scanner
+uvicorn app.main:app --host 0.0.0.0 --port 8000          # API + UI + header scanner (first start prints/creates the admin key)
 
 cd ../frontend && npm install && npm run build           # UI is then served by uvicorn at :8000
 # or `npm run dev` for hot reload on :5173 (proxies to :8000)
 ```
 
 ## Run with Podman + systemd (Quadlet)
-Units for Podman 4.4+ are in [`deploy/podman`](deploy/podman): `nzbforge` (API + UI on :8000) and `nzbforge-scanner`,
-sharing the `nzbforge-data` volume (SQLite in `/data`) and the `nzbforge` network.
+Units for Podman 4.4+ are in [`deploy/podman`](deploy/podman): one `nzbforge` container (API + UI on :8000 and the
+header scanner in the same process) with the `nzbforge-data` volume (SQLite in `/data`).
 
 ```bash
 git clone https://github.com/jwklijnsma/nzbforge && cd nzbforge/deploy/podman
 ./install.sh                     # rootless: ~/.config/containers/systemd; use `sudo ./install.sh` for rootful
 $EDITOR ~/.config/nzbforge/nzbforge.env      # NNTP_* (ADMIN_KEY is generated)
-systemctl --user start nzbforge nzbforge-scanner
+systemctl --user start nzbforge
 loginctl enable-linger $USER     # start at boot / keep running after logout
 podman exec nzbforge python -m app.cli add-group alt.binaries.example
-journalctl --user -u nzbforge-scanner -f
+journalctl --user -u nzbforge -f
 ```
 The units carry `AutoUpdate=registry`, so `systemctl --user enable --now podman-auto-update.timer` keeps them on the latest release.
 If the GHCR package is private, run `podman login ghcr.io` first.
@@ -61,6 +60,11 @@ Categories: 2000 Movies, 3000 Audio, 5000 TV, 7000 Other. Use `python -m app.cli
 Behind a reverse proxy run uvicorn with `--proxy-headers` so NZB links get the right host.
 
 ## How it works
+The scanner runs as a background thread inside the uvicorn process (one process, one container). It starts
+automatically when `NNTP_HOST` is set; `SCANNER=0` turns it off, `SCANNER=1` forces it on. Keep uvicorn at one
+worker (the default), or each worker starts its own scanner. To run it separately anyway: `SCANNER=0` for uvicorn
+plus `python -m app.scanner`.
+
 1. `scanner.py` pulls XOVER headers from your Usenet provider, parses `"file.ext" yEnc (n/N)` subjects and groups them per poster + base name into collections.
 2. When a collection is complete (or >= MIN_COMPLETION and idle 2h) it becomes a `Release`, classified into Newznab categories with season/episode parsed from the name.
 3. `/api?t=get` builds the NZB on the fly from the stored message-ids.

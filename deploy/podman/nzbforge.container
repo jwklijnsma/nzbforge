@@ -1,6 +1,6 @@
-# nzbforge web: Newznab API (/api) + React UI on port 8000
+# nzbforge: Newznab API (/api) + React UI on port 8000 + Usenet header scanner, in one process
 [Unit]
-Description=nzbforge web (API + UI)
+Description=nzbforge (API + UI + scanner)
 Wants=network-online.target
 After=network-online.target
 
