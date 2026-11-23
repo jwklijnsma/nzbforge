@@ -172,6 +172,28 @@ def add_group(body: GroupIn, admin: User = Depends(admin_user), db=Depends(get_d
     return {"ok": True}
 
 
+class GroupImport(BaseModel):
+    pattern: str = "alt.binaries.*"
+    min_articles: int = 1
+
+
+@app.post("/web/groups/import")
+def import_groups(body: GroupImport, admin: User = Depends(admin_user), db=Depends(get_db)):
+    if not scanner.HOST:
+        raise HTTPException(400, "NNTP_HOST is not set")
+    try:
+        nntp = scanner.NNTP(scanner.HOST, scanner.PORT, scanner.USER, scanner.PASS, scanner.USE_SSL)
+    except (OSError, RuntimeError) as e:
+        raise HTTPException(502, f"Usenet server: {e}")
+    try:
+        added, matched = scanner.import_groups(db, nntp, body.pattern.strip() or "*", max(0, body.min_articles))
+    except RuntimeError as e:
+        raise HTTPException(502, f"Usenet server: {e}")
+    finally:
+        nntp.close()
+    return {"matched": matched, "added": added}
+
+
 # Serve the built React app (run `npm run build` in frontend/). Mounted last so /api and /web win.
 DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 if DIST.exists():

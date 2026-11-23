@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -9,13 +10,16 @@ sys.path.insert(0, str(ROOT / "backend"))
 
 ADMIN_KEY = "test-admin-key"
 
+# Must be set before anything imports app.db (test modules import app.* at collection time).
+_tmp = tempfile.mkdtemp(prefix="nzbforge-test-")
+os.environ["DATABASE_URL"] = f"sqlite:///{_tmp}/test.db"
+os.environ["ADMIN_KEY"] = ADMIN_KEY
+os.environ.pop("NNTP_HOST", None)
+os.environ["SCANNER"] = "0"
+
 
 @pytest.fixture(scope="session")
-def client(tmp_path_factory):
-    db_file = tmp_path_factory.mktemp("db") / "test.db"
-    os.environ["DATABASE_URL"] = f"sqlite:///{db_file}"
-    os.environ["ADMIN_KEY"] = ADMIN_KEY
-
+def client():
     from fastapi.testclient import TestClient
     from app.main import app
 
