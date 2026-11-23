@@ -1,9 +1,14 @@
-"""Usenet header scanner: NNTP -> collections -> releases.  Run: python -m app.scanner"""
+"""Usenet header scanner: NNTP -> collections -> releases.
+
+Runs inside the web process by default (started from app.main, see SCANNER),
+or standalone with: python -m app.scanner
+"""
 import hashlib
 import logging
 import os
 import socket
 import ssl
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -249,23 +254,51 @@ def scan_group(nntp, db, g):
         a = b + 1
 
 
-def run():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    init_db()
-    while True:
+def scan_pass():
+    nntp = NNTP(HOST, PORT, USER, PASS, USE_SSL)
+    try:
+        with SessionLocal() as db:
+            for g in db.scalars(select(Group).where(Group.active)).all():
+                scan_group(nntp, db, g)
+            finalize(db)
+            enrich_pending(db)
+            fetch_nfos(nntp, db)
+    finally:
+        nntp.close()
+
+
+def run(stop: threading.Event | None = None):
+    stop = stop or threading.Event()
+    while not stop.is_set():
         try:
-            nntp = NNTP(HOST, PORT, USER, PASS, USE_SSL)
-            with SessionLocal() as db:
-                for g in db.scalars(select(Group).where(Group.active)).all():
-                    scan_group(nntp, db, g)
-                finalize(db)
-                enrich_pending(db)
-                fetch_nfos(nntp, db)
-            nntp.close()
+            scan_pass()
         except Exception:
             log.exception("scan pass failed")
-        time.sleep(INTERVAL)
+        stop.wait(INTERVAL)
+
+
+def enabled() -> bool:
+    """SCANNER=1/0 forces it on/off; default (auto): on when NNTP_HOST is set."""
+    mode = os.getenv("SCANNER", "auto").strip().lower()
+    if mode in ("1", "true", "yes", "on"):
+        return True
+    if mode in ("0", "false", "no", "off"):
+        return False
+    return bool(HOST)
+
+
+def start_background() -> threading.Event:
+    """Start the scan loop in a daemon thread next to the web app. Returns the stop event."""
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    log.setLevel(logging.INFO)
+    stop = threading.Event()
+    threading.Thread(target=run, args=(stop,), name="scanner", daemon=True).start()
+    log.info("scanner started in background (every %ss)", INTERVAL)
+    return stop
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    init_db()
     run()

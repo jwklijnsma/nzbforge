@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from . import newznab as nz
+from . import scanner
 from .db import SessionLocal, init_db
 from .models import Group, Release, User
 from .nzb import build_nzb
@@ -24,7 +25,10 @@ async def lifespan(app: FastAPI):
             db.add(User(username="admin", api_key=key, is_admin=True))
             db.commit()
             print(f"[nzbforge] created admin user, API key: {key}")
+    stop = scanner.start_background() if scanner.enabled() else None
     yield
+    if stop:
+        stop.set()
 
 
 app = FastAPI(title="nzbforge", lifespan=lifespan)

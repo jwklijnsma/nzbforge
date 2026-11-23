@@ -20,5 +20,5 @@ USER nzbforge
 VOLUME /data
 WORKDIR /app/backend
 EXPOSE 8000
-# API + UI. Run the scanner as a second container: command ["python", "-m", "app.scanner"]
+# API + UI + header scanner (background thread, see SCANNER in .env.example)
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
