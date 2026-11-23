@@ -39,3 +39,15 @@ def test_groups_and_stats(client):
     assert [g["name"] for g in client.get("/web/groups", headers=h).json()] == ["alt.binaries.test"]
     s = client.get("/web/stats", headers=h).json()
     assert s["groups"] == 1 and s["releases"] == 0
+
+
+def test_group_toggle_delete_and_pull(client):
+    h = {"X-Api-Key": ADMIN_KEY}
+    client.post("/web/groups", json={"name": "alt.binaries.toggle"}, headers=h)
+    r = client.patch("/web/groups/alt.binaries.toggle", json={"active": False}, headers=h)
+    assert r.json()["active"] is False
+    assert client.post("/web/pull", json={}, headers=h).status_code == 400  # NNTP_HOST not set in tests
+    jobs = client.get("/web/jobs", headers=h).json()
+    assert {"scanner", "import"} <= set(jobs)
+    assert client.delete("/web/groups/alt.binaries.toggle", headers=h).json() == {"ok": True}
+    assert client.delete("/web/groups/alt.binaries.toggle", headers=h).status_code == 404

@@ -12,7 +12,7 @@ from sqlalchemy import func, or_, select
 from . import newznab as nz
 from . import downloader, scanner
 from .db import SessionLocal, init_db
-from .models import Group, Release, User
+from .models import Collection, Group, Release, User
 from .nzb import build_nzb
 
 
@@ -30,6 +30,7 @@ async def lifespan(app: FastAPI):
     yield
     if stop:
         stop.set()
+        scanner.wake()
 
 
 app = FastAPI(title="nzbforge", lifespan=lifespan)
@@ -206,10 +207,19 @@ class GroupIn(BaseModel):
     name: str
 
 
+def _group(g: Group) -> dict:
+    backlog = None
+    if g.server_last:
+        start = g.last_article or max(g.server_first or 0, g.server_last - scanner.INITIAL)
+        backlog = max(0, g.server_last - start)
+    return {"name": g.name, "active": g.active, "last_article": g.last_article, "server_first": g.server_first,
+            "server_last": g.server_last, "backlog": backlog, "scanned_at": g.scanned_at.isoformat() + "Z" if g.scanned_at else None,
+            "error": g.last_error}
+
+
 @app.get("/web/groups")
 def list_groups(admin: User = Depends(admin_user), db=Depends(get_db)):
-    return [{"name": g.name, "last_article": g.last_article, "active": g.active}
-            for g in db.scalars(select(Group).order_by(Group.name))]
+    return [_group(g) for g in db.scalars(select(Group).order_by(Group.name))]
 
 
 @app.post("/web/groups")
@@ -222,26 +232,67 @@ def add_group(body: GroupIn, admin: User = Depends(admin_user), db=Depends(get_d
     return {"ok": True}
 
 
+class GroupPatch(BaseModel):
+    active: bool
+
+
+@app.patch("/web/groups/{name}")
+def set_group_active(name: str, body: GroupPatch, admin: User = Depends(admin_user), db=Depends(get_db)):
+    g = db.scalar(select(Group).where(Group.name == name))
+    if not g:
+        raise HTTPException(404, "No such group")
+    g.active = body.active
+    db.commit()
+    return _group(g)
+
+
+@app.delete("/web/groups/{name}")
+def delete_group(name: str, admin: User = Depends(admin_user), db=Depends(get_db)):
+    g = db.scalar(select(Group).where(Group.name == name))
+    if not g:
+        raise HTTPException(404, "No such group")
+    db.execute(Collection.__table__.delete().where(Collection.group_id == g.id))
+    db.delete(g)
+    db.commit()
+    return {"ok": True}
+
+
 class GroupImport(BaseModel):
     pattern: str = "alt.binaries.*"
     min_articles: int = 1
 
 
-@app.post("/web/groups/import")
-def import_groups(body: GroupImport, admin: User = Depends(admin_user), db=Depends(get_db)):
+@app.post("/web/groups/import", status_code=202)
+def import_groups(body: GroupImport, admin: User = Depends(admin_user)):
+    """Starts the import in the background; follow it with GET /web/jobs."""
     if not scanner.HOST:
         raise HTTPException(400, "NNTP_HOST is not set")
-    try:
-        nntp = scanner.NNTP(scanner.HOST, scanner.PORT, scanner.USER, scanner.PASS, scanner.USE_SSL)
-    except (OSError, RuntimeError) as e:
-        raise HTTPException(502, f"Usenet server: {e}")
-    try:
-        added, matched = scanner.import_groups(db, nntp, body.pattern.strip() or "*", max(0, body.min_articles))
-    except RuntimeError as e:
-        raise HTTPException(502, f"Usenet server: {e}")
-    finally:
-        nntp.close()
-    return {"matched": matched, "added": added}
+    if not scanner.start_import(body.pattern.strip() or "*", max(0, body.min_articles)):
+        raise HTTPException(409, "An import is already running")
+    return scanner.status()["import"]
+
+
+class PullIn(BaseModel):
+    groups: list[str] = []
+
+
+@app.post("/web/pull", status_code=202)
+def pull(body: PullIn, admin: User = Depends(admin_user), db=Depends(get_db)):
+    """'Pull now': scan all active groups, or only the given ones, in the background."""
+    if not scanner.HOST:
+        raise HTTPException(400, "NNTP_HOST is not set")
+    names = [n.strip().lower() for n in body.groups if n.strip()]
+    if names:
+        known = set(db.scalars(select(Group.name).where(Group.name.in_(names))))
+        if missing := sorted(set(names) - known):
+            raise HTTPException(404, f"Unknown group: {', '.join(missing)}")
+    scanner.request_pull(names or None)
+    return scanner.status()["scanner"]
+
+
+@app.get("/web/jobs")
+def jobs(user: User = Depends(current_user)):
+    return scanner.status()
 
 
 # Serve the built React app (run `npm run build` in frontend/). Mounted last so /api and /web win.

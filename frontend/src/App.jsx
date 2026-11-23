@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./styles.css";
 
 // Spotweb-like colour per Newznab parent category
@@ -350,64 +350,271 @@ function SpotPanel({ api, apiKey, me, guid, onClose }) {
   );
 }
 
-function Admin({ api, apiKey }) {
+const fmtAgo = (iso) => {
+  if (!iso) return "never";
+  const s = Math.max(0, (Date.now() - new Date(iso)) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  if (s < 86400) return `${Math.round(s / 3600)} h ago`;
+  return `${Math.round(s / 86400)} d ago`;
+};
+const fmtIn = (iso, now) => {
+  const s = Math.max(0, Math.round((new Date(iso) - now) / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+};
+const num = (n) => (n ?? 0).toLocaleString();
+const BUSY = (st) => st && !["idle", "waiting"].includes(st);
+
+function useJobs(api, fast, enabled) {
+  const [jobs, setJobs] = useState(null);
+  useEffect(() => {
+    if (!enabled) return undefined;
+    let live = true, timer;
+    const tick = async () => {
+      try { const j = await api("/web/jobs"); if (live) setJobs(j); } catch { /* keep last */ }
+      if (live) timer = setTimeout(tick, fast ? 1500 : 5000);
+    };
+    tick();
+    return () => { live = false; clearTimeout(timer); };
+  }, [api, fast, enabled]);
+  return [jobs, setJobs];
+}
+
+function Bar({ value, label }) {
+  const pct = value == null ? null : Math.max(0, Math.min(100, value * 100));
+  return (
+    <div className={`bar ${pct == null ? "indeterminate" : ""}`} role="progressbar" aria-label={label}
+      aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct == null ? undefined : Math.round(pct)}>
+      <span style={pct == null ? undefined : { width: `${pct}%` }} />
+    </div>
+  );
+}
+
+function scanFraction(sc) {
+  const span = sc.article_to - sc.article_from + 1;
+  const inGroup = span > 0 && sc.article ? Math.min(1, (sc.article - sc.article_from + 1) / span) : 0;
+  return { inGroup, overall: sc.group_count ? (sc.group_index - 1 + inGroup) / sc.group_count : 0 };
+}
+
+function JobPill({ jobs, onClick }) {
+  if (!jobs) return null;
+  const sc = jobs.scanner, im = jobs.import;
+  let text = null;
+  if (sc.state === "scanning") text = `Pulling ${sc.group_index}/${sc.group_count} · ${Math.round(scanFraction(sc).overall * 100)}%`;
+  else if (BUSY(sc.state)) text = sc.state.charAt(0).toUpperCase() + sc.state.slice(1) + "…";
+  else if (im.state === "running") text = `Importing groups · ${num(im.matched)}`;
+  if (!text) return null;
+  return <button className="jobpill" onClick={onClick} title="Show progress"><span className="spin" aria-hidden="true" />{text}</button>;
+}
+
+function ScannerCard({ api, jobs, setJobs, hasGroups }) {
+  const [error, setError] = useState("");
+  const [now, setNow] = useState(Date.now());
+  const [showErr, setShowErr] = useState(false);
+  useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(t); }, []);
+  if (!jobs) return <div className="card"><p className="count">Loading scanner status…</p></div>;
+  const sc = jobs.scanner, lp = sc.last_pass;
+  const busy = BUSY(sc.state);
+  const { inGroup, overall } = scanFraction(sc);
+  const pullAll = async () => {
+    setError("");
+    try { const s = await api("/web/pull", { method: "POST", body: JSON.stringify({}) }); setJobs((j) => ({ ...j, scanner: { ...j.scanner, ...s, state: s.state === "idle" ? "connecting" : s.state } })); }
+    catch (e) { setError(e.message); }
+  };
+  return (
+    <div className="card">
+      <div className="cardhead">
+        <h3>Scanner</h3>
+        <button onClick={pullAll} disabled={busy || !hasGroups} title={hasGroups ? "" : "Add groups first"}>
+          {busy ? "Pulling…" : "Pull all groups now"}
+        </button>
+      </div>
+      {sc.state === "scanning" && (
+        <>
+          <p><b>{sc.group}</b> <span className="count">group {num(sc.group_index)} of {num(sc.group_count)}</span></p>
+          <Bar value={inGroup} label="Current group" />
+          <p className="count small">
+            {sc.article_to ? `${num(Math.max(0, sc.article - sc.article_from + 1))} of ${num(sc.article_to - sc.article_from + 1)} headers (${Math.round(inGroup * 100)}%)` : "Selecting group…"}
+          </p>
+          <p className="count small">All groups: {Math.round(overall * 100)}%</p>
+          <Bar value={overall} label="All groups" />
+          <p className="count small">{num(sc.headers)} headers this pull · started {fmtAgo(sc.started)}</p>
+        </>
+      )}
+      {busy && sc.state !== "scanning" && (<><p>{sc.state.charAt(0).toUpperCase() + sc.state.slice(1)}…</p><Bar value={null} label={sc.state} /></>)}
+      {!busy && (
+        <p className="count">
+          {sc.enabled
+            ? (sc.next_run ? <>Waiting · next pull in <b>{fmtIn(sc.next_run, now)}</b></> : "Idle")
+            : "Automatic pulling is off (SCANNER=0 or NNTP_HOST not set). You can still pull by hand."}
+        </p>
+      )}
+      {sc.queued?.length > 0 && <p className="count small">Queued: {sc.queued.join(", ")}</p>}
+      {lp && (
+        <p className="lastpass">
+          Last pull {fmtAgo(lp.finished)}: {num(lp.groups)} group{lp.groups === 1 ? "" : "s"}{lp.only ? " (by hand)" : ""}, {num(lp.headers)} headers,
+          {" "}<b>{num(lp.releases)} new releases</b>, took {lp.seconds < 120 ? `${lp.seconds}s` : `${Math.round(lp.seconds / 60)} min`}
+          {lp.errors?.length > 0 && <> · <button className="link bad" onClick={() => setShowErr((v) => !v)}>{lp.errors.length} error{lp.errors.length > 1 ? "s" : ""}</button></>}
+        </p>
+      )}
+      {showErr && lp?.errors?.length > 0 && <ul className="errs">{lp.errors.slice(0, 50).map((e) => <li key={e}>{e}</li>)}</ul>}
+      {error && <p className="error">{error}</p>}
+    </div>
+  );
+}
+
+function ImportCard({ api, jobs, setJobs, onDone }) {
+  const [name, setName] = useState("");
+  const [pattern, setPattern] = useState("alt.binaries.*");
+  const [minArticles, setMinArticles] = useState(1);
+  const [error, setError] = useState("");
+  const im = jobs?.import;
+  const running = im?.state === "running";
+  const prev = useRef(im?.state);
+  useEffect(() => { if (prev.current === "running" && im?.state !== "running") onDone(); prev.current = im?.state; }, [im?.state, onDone]);
+
+  const add = async () => {
+    setError("");
+    try { await api("/web/groups", { method: "POST", body: JSON.stringify({ name }) }); setName(""); onDone(); }
+    catch (e) { setError(e.message); }
+  };
+  const importAll = async () => {
+    setError("");
+    try {
+      const r = await api("/web/groups/import", { method: "POST", body: JSON.stringify({ pattern, min_articles: Number(minArticles) || 0 }) });
+      setJobs((j) => ({ ...j, import: r }));
+    } catch (e) { setError(e.message); }
+  };
+  return (
+    <div className="card">
+      <h3>Add groups</h3>
+      <div className="row">
+        <input value={name} placeholder="alt.binaries.example" aria-label="Group name" onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && name && add()} />
+        <button onClick={add} disabled={!name}>Add group</button>
+      </div>
+      <div className="row">
+        <input value={pattern} placeholder="alt.binaries.*" aria-label="Group pattern" onChange={(e) => setPattern(e.target.value)} />
+        <label className="minart">min. articles
+          <input type="number" min="0" step="1000" value={minArticles} onChange={(e) => setMinArticles(e.target.value)} />
+        </label>
+        <button onClick={importAll} disabled={running}>{running ? "Importing…" : "Import all from provider"}</button>
+      </div>
+      {running && (<><Bar value={null} label="Group import" /><p className="count small">Reading the group list from your provider · {num(im.matched)} matching so far</p></>)}
+      {im?.state === "done" && <p className="count small">Import of <code>{im.pattern}</code> {fmtAgo(im.finished)}: {num(im.matched)} groups match, <b>{num(im.added)} new</b> added.</p>}
+      {im?.state === "failed" && <p className="error">Import failed: {im.error}</p>}
+      {error && <p className="error">{error}</p>}
+    </div>
+  );
+}
+
+const GROUP_PAGE = 200;
+
+function Admin({ api, apiKey, jobs, setJobs }) {
   const [groups, setGroups] = useState([]);
   const [stats, setStats] = useState(null);
-  const [name, setName] = useState("");
   const [error, setError] = useState("");
-  const [pattern, setPattern] = useState("alt.binaries.*");
-  const [importing, setImporting] = useState(false);
-  const [notice, setNotice] = useState("");
+  const [filter, setFilter] = useState("");
+  const [show, setShow] = useState("all");
+  const [limit, setLimit] = useState(GROUP_PAGE);
+  const [busyRow, setBusyRow] = useState("");
 
   const load = useCallback(async () => {
     try {
-      setStats(await api("/web/stats"));
-      setGroups(await api("/web/groups"));
+      const [s, g] = await Promise.all([api("/web/stats"), api("/web/groups")]);
+      setStats(s); setGroups(g); setError("");
     } catch (e) { setError(e.message); }
   }, [api]);
   useEffect(() => { load(); }, [load]);
 
-  const add = async () => {
-    try {
-      await api("/web/groups", { method: "POST", body: JSON.stringify({ name }) });
-      setName(""); setError(""); load();
-    } catch (e) { setError(e.message); }
-  };
+  // refresh the table whenever a pull finishes or moves on to the next group
+  const sc = jobs?.scanner;
+  useEffect(() => { if (sc) load(); }, [sc?.last_pass?.finished, sc?.group]); // eslint-disable-line
 
-  const importAll = async () => {
-    setImporting(true); setNotice(""); setError("");
-    try {
-      const r = await api("/web/groups/import", { method: "POST", body: JSON.stringify({ pattern }) });
-      setNotice(`${r.matched} groups on your provider match ${pattern}; ${r.added} new added.`);
-      load();
-    } catch (e) { setError(e.message); }
-    setImporting(false);
+  const act = async (name, fn) => {
+    setBusyRow(name);
+    try { await fn(); } catch (e) { setError(e.message); }
+    setBusyRow("");
   };
+  const toggle = (g) => act(g.name, async () => {
+    const r = await api(`/web/groups/${encodeURIComponent(g.name)}`, { method: "PATCH", body: JSON.stringify({ active: !g.active }) });
+    setGroups((gs) => gs.map((x) => (x.name === g.name ? r : x)));
+  });
+  const remove = (g) => {
+    if (!window.confirm(`Remove ${g.name}? Releases already indexed stay; unfinished collections are dropped.`)) return;
+    act(g.name, async () => {
+      await api(`/web/groups/${encodeURIComponent(g.name)}`, { method: "DELETE" });
+      setGroups((gs) => gs.filter((x) => x.name !== g.name));
+    });
+  };
+  const pullOne = (g) => act(g.name, async () => {
+    const s = await api("/web/pull", { method: "POST", body: JSON.stringify({ groups: [g.name] }) });
+    setJobs((j) => ({ ...j, scanner: { ...j.scanner, ...s } }));
+  });
+
+  const f = filter.trim().toLowerCase();
+  const shown = groups.filter((g) => (!f || g.name.includes(f)) &&
+    (show === "all" || (show === "active" && g.active) || (show === "off" && !g.active) || (show === "errors" && g.error)));
+  const queued = new Set(sc?.queued || []);
+  const active = groups.filter((g) => g.active).length;
+  const backlog = groups.reduce((n, g) => n + (g.active && g.backlog ? g.backlog : 0), 0);
 
   return (
-    <section>
+    <section className="admin">
       {stats && (
         <p className="count">
-          {stats.releases.toLocaleString()} releases across {stats.groups} groups
-          {stats.newest && `, newest from ${new Date(stats.newest).toLocaleString()}`}
+          {num(stats.releases)} releases · {num(active)} of {num(groups.length)} groups active
+          {backlog > 0 && ` · ${num(backlog)} headers still to pull`}
+          {stats.newest && ` · newest from ${new Date(stats.newest).toLocaleString()}`}
         </p>
       )}
-      <div className="searchbar">
-        <input value={name} placeholder="alt.binaries.example" onChange={(e) => setName(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && add()} />
-        <button onClick={add}>Add group</button>
+      <div className="cards">
+        <ScannerCard api={api} jobs={jobs} setJobs={setJobs} hasGroups={active > 0} />
+        <ImportCard api={api} jobs={jobs} setJobs={setJobs} onDone={load} />
       </div>
-      <div className="searchbar">
-        <input value={pattern} placeholder="alt.binaries.*" onChange={(e) => setPattern(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && importAll()} />
-        <button onClick={importAll} disabled={importing}>{importing ? "Importing…" : "Import all from provider"}</button>
-      </div>
-      {notice && <p className="count">{notice}</p>}
       {error && <p className="error">{error}</p>}
-      <table>
-        <thead><tr><th>Group</th><th>Last article scanned</th></tr></thead>
-        <tbody>{groups.map((g) => <tr key={g.name}><td className="name">{g.name}</td><td>{g.last_article || "not scanned yet"}</td></tr>)}</tbody>
-      </table>
+
+      <div className="grouphead">
+        <h3>Groups</h3>
+        <input value={filter} placeholder="Filter groups" aria-label="Filter groups" onChange={(e) => { setFilter(e.target.value); setLimit(GROUP_PAGE); }} />
+        <div className="seg" role="group" aria-label="Show">
+          {[["all", "All"], ["active", "Active"], ["off", "Off"], ["errors", "Errors"]].map(([v, l]) => (
+            <button key={v} className={show === v ? "on" : ""} aria-pressed={show === v} onClick={() => { setShow(v); setLimit(GROUP_PAGE); }}>{l}</button>
+          ))}
+        </div>
+        <span className="count">{num(shown.length)} shown</span>
+      </div>
+      {groups.length === 0 ? (
+        <p className="empty">No groups yet. Add one above, or import all groups from your provider.</p>
+      ) : (
+        <table className="groups">
+          <thead><tr><th>On</th><th>Group</th><th>Pulled up to</th><th>Newest on server</th><th>To pull</th><th>Last pulled</th><th><span className="sr">Actions</span></th></tr></thead>
+          <tbody>
+            {shown.slice(0, limit).map((g) => {
+              const now = sc?.state === "scanning" && sc.group === g.name;
+              const frac = now ? scanFraction(sc).inGroup : null;
+              return (
+                <tr key={g.name} className={`${g.active ? "" : "off"} ${now ? "pulling" : ""}`}>
+                  <td><input type="checkbox" checked={g.active} disabled={busyRow === g.name} onChange={() => toggle(g)} aria-label={`Pull ${g.name} automatically`} /></td>
+                  <td className="name">{g.name}{g.error && <div className="error small" title={g.error}>{g.error}</div>}</td>
+                  <td className="num">{g.last_article ? num(g.last_article) : "–"}</td>
+                  <td className="num">{g.server_last ? num(g.server_last) : "–"}</td>
+                  <td className="num">
+                    {now ? <><Bar value={frac} label={`Pulling ${g.name}`} /><span className="small">{Math.round(frac * 100)}%</span></>
+                      : g.backlog == null ? "–" : g.backlog === 0 ? "✓" : num(g.backlog)}
+                  </td>
+                  <td>{now ? "pulling now" : queued.has(g.name) ? "queued" : fmtAgo(g.scanned_at)}</td>
+                  <td className="acts">
+                    <button className="small" onClick={() => pullOne(g)} disabled={now || queued.has(g.name) || busyRow === g.name}>Pull</button>
+                    <button className="small ghost" onClick={() => remove(g)} disabled={busyRow === g.name}>Remove</button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+      {shown.length > limit && <button className="more" onClick={() => setLimit((l) => l + GROUP_PAGE)}>Show more ({num(shown.length - limit)} left)</button>}
       <div className="indexer-url">
         <p>Add this to Prowlarr as a Generic Newznab indexer:</p>
         <code>URL: {location.origin} &nbsp; API path: /api &nbsp; API key: {apiKey}</code>
@@ -423,6 +630,7 @@ export default function App() {
   const [input, setInput] = useState("");
   const [q, setQ] = useState("");
   const api = useMemo(() => makeApi(key), [key]);
+  const [jobs, setJobs] = useJobs(api, tab === "admin", !!me);
 
   useEffect(() => {
     if (!key) return;
@@ -442,13 +650,14 @@ export default function App() {
           <input value={input} placeholder="Search spots" aria-label="Search spots" onChange={(e) => setInput(e.target.value)} />
           <button type="submit">Search</button>
         </form>
+        <JobPill jobs={jobs} onClick={() => me.is_admin && setTab("admin")} />
         <nav>
           <button className={tab === "spots" ? "on" : ""} onClick={() => setTab("spots")}>Spots</button>
           {me.is_admin && <button className={tab === "admin" ? "on" : ""} onClick={() => setTab("admin")}>Admin</button>}
           <button onClick={() => { localStorage.removeItem("nzbforge-key"); setKey(""); setMe(null); }}>Sign out ({me.username})</button>
         </nav>
       </header>
-      {tab === "spots" ? <Spots api={api} apiKey={key} me={me} q={q} /> : <div className="adminwrap"><Admin api={api} apiKey={key} /></div>}
+      {tab === "spots" ? <Spots api={api} apiKey={key} me={me} q={q} /> : <div className="adminwrap"><Admin api={api} apiKey={key} jobs={jobs} setJobs={setJobs} /></div>}
     </div>
   );
 }
