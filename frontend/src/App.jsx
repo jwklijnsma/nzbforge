@@ -20,7 +20,11 @@ function makeApi(key) {
       ...opts,
       headers: { "X-Api-Key": key, "Content-Type": "application/json" },
     });
-    if (!res.ok) throw new Error(res.status === 401 ? "That API key was not accepted." : `Request failed (${res.status}).`);
+    if (!res.ok) {
+      if (res.status === 401) throw new Error("That API key was not accepted.");
+      const detail = await res.json().then((j) => j.detail).catch(() => null);
+      throw new Error(typeof detail === "string" ? detail : `Request failed (${res.status}).`);
+    }
     return res.json();
   };
 }
@@ -184,6 +188,9 @@ function Admin({ api, apiKey }) {
   const [stats, setStats] = useState(null);
   const [name, setName] = useState("");
   const [error, setError] = useState("");
+  const [pattern, setPattern] = useState("alt.binaries.*");
+  const [importing, setImporting] = useState(false);
+  const [notice, setNotice] = useState("");
 
   const load = useCallback(async () => {
     try {
@@ -200,6 +207,16 @@ function Admin({ api, apiKey }) {
     } catch (e) { setError(e.message); }
   };
 
+  const importAll = async () => {
+    setImporting(true); setNotice(""); setError("");
+    try {
+      const r = await api("/web/groups/import", { method: "POST", body: JSON.stringify({ pattern }) });
+      setNotice(`${r.matched} groups on your provider match ${pattern}; ${r.added} new added.`);
+      load();
+    } catch (e) { setError(e.message); }
+    setImporting(false);
+  };
+
   return (
     <section>
       {stats && (
@@ -213,6 +230,12 @@ function Admin({ api, apiKey }) {
           onKeyDown={(e) => e.key === "Enter" && add()} />
         <button onClick={add}>Add group</button>
       </div>
+      <div className="searchbar">
+        <input value={pattern} placeholder="alt.binaries.*" onChange={(e) => setPattern(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && importAll()} />
+        <button onClick={importAll} disabled={importing}>{importing ? "Importing…" : "Import all from provider"}</button>
+      </div>
+      {notice && <p className="count">{notice}</p>}
       {error && <p className="error">{error}</p>}
       <table>
         <thead><tr><th>Group</th><th>Last article scanned</th></tr></thead>

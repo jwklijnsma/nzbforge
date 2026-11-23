@@ -3,6 +3,7 @@
 Runs inside the web process by default (started from app.main, see SCANNER),
 or standalone with: python -m app.scanner
 """
+import fnmatch
 import hashlib
 import logging
 import os
@@ -80,6 +81,23 @@ class NNTP:
         if code != 224:
             raise RuntimeError(f"XOVER: {code} {msg}")
         return self._multiline()
+
+    def list_active(self, pattern="*"):
+        """[(name, first, last, flag)] from LIST ACTIVE (falls back to plain LIST)."""
+        code, msg = self.cmd(f"LIST ACTIVE {pattern}")
+        if code != 215:
+            code, msg = self.cmd("LIST")
+        if code != 215:
+            raise RuntimeError(f"LIST: {code} {msg}")
+        out = []
+        for line in self._multiline():
+            parts = line.split()
+            if len(parts) >= 4 and fnmatch.fnmatchcase(parts[0], pattern):
+                try:
+                    out.append((parts[0].lower(), int(parts[2]), int(parts[1]), parts[3]))
+                except ValueError:
+                    continue
+        return out
 
     def _raw_multiline(self):
         lines = []
@@ -240,8 +258,26 @@ def fetch_nfos(nntp, db, limit=NFO_PER_PASS):
     log.info("nfo: fetched %d", done)
 
 
+def import_groups(db, nntp, pattern="alt.binaries.*", min_articles=1):
+    """Add every group on the provider matching pattern (with >= min_articles). Returns (added, matched)."""
+    have = set(db.scalars(select(Group.name)))
+    matched = added = 0
+    for name, first, last, flag in nntp.list_active(pattern):
+        if flag.startswith(("=", "x")) or last - first + 1 < min_articles:
+            continue  # aliases, removed groups, (almost) empty groups
+        matched += 1
+        if name not in have:
+            db.add(Group(name=name))
+            have.add(name)
+            added += 1
+    db.commit()
+    return added, matched
+
+
 def scan_group(nntp, db, g):
     first, last = nntp.group(g.name)
+    if last < first or last == 0:
+        return  # empty group
     if g.last_article > last:  # provider reset numbering
         g.last_article = 0
     a = g.last_article + 1 if g.last_article else max(first, last - INITIAL)
@@ -259,7 +295,11 @@ def scan_pass():
     try:
         with SessionLocal() as db:
             for g in db.scalars(select(Group).where(Group.active)).all():
-                scan_group(nntp, db, g)
+                try:
+                    scan_group(nntp, db, g)
+                except RuntimeError as e:  # NNTP error for this group only; keep going
+                    db.rollback()
+                    log.warning("%s: skipped (%s)", g.name, e)
             finalize(db)
             enrich_pending(db)
             fetch_nfos(nntp, db)
