@@ -1,16 +1,25 @@
 name: Automatic Release
+
 on:
   push:
-    tags:
-      - 'v*.*.*'
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
 jobs:
+  test:
+    uses: ./.github/workflows/tests.yml
+
   release:
+    needs: test
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - name: Create Release
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: ${{ github.ref_name }}
-        name: Release ${{ github.ref_name }}
-        body: Release created automatically.
+      - uses: actions/checkout@v4
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
