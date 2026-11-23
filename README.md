@@ -69,3 +69,16 @@ Behind a reverse proxy run uvicorn with `--proxy-headers` so NZB links get the r
 
 > **API Key UI Note**: The API key management interface shows a "Generate New API Key" button. When clicked, it displays a secure 64-character hex key with a "Copy" button for easy clipboard access. The interface uses a clean, minimal design with light background styling.
 > **Note**: Please add the screenshot image to `screenshots/api_key_ui_screenshot.png` to display the UI image.
+## Releases
+Releases are automatic. Every push to `main` runs the tests and, if there is something to release, creates a
+`vX.Y.Z` tag, a GitHub release with generated notes, and Docker images `ghcr.io/jwklijnsma/nzbforge:X.Y.Z` / `:X.Y` / `:latest`.
+The bump follows the commit messages since the last tag:
+
+| Commit | Bump |
+|---|---|
+| `feat!: ...`, `fix!: ...` or `BREAKING CHANGE` in the body | major |
+| `feat: ...` | minor |
+| `fix: ...` or any other message | patch |
+| only `chore:` / `ci:` / `docs:` / `test:` / `style:` / `build:` (e.g. Renovate) | no release |
+
+To force a release: Actions → **Automatic Release** → Run workflow, then pick patch/minor/major.

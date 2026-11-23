@@ -3,9 +3,14 @@ name: Build and Push Docker Image
 on:
   push:
     branches: [main]
-    tags: ["v*.*.*"]
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      version:
+        description: Release version (without v), adds semver tags
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -42,6 +47,9 @@ jobs:
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{version}},value=${{ inputs.version }},enable=${{ inputs.version != '' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.version }},enable=${{ inputs.version != '' }}
+            type=semver,pattern={{major}},value=${{ inputs.version }},enable=${{ inputs.version != '' && !startsWith(inputs.version, '0.') }}
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
 
