@@ -1,19 +1,16 @@
-name: Create GitHub Release
+name: Automatic Release
 on:
   push:
     tags:
-      - 'v*'
+      - 'v*.*.*'
 jobs:
-  create-release:
+  release:
     runs-on: ubuntu-latest
     steps:
+    - uses: actions/checkout@v4
     - name: Create Release
       uses: softprops/action-gh-release@v1
       with:
         tag_name: ${{ github.ref_name }}
         name: Release ${{ github.ref_name }}
-        body: |-
-          Automated release created for version ${{ github.ref_name }}
-          
-          This release was automatically created when a new tag was pushed to the repository.
-          See [release notes](https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}) for details.
+        body: Release created automatically.
