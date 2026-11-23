@@ -1,0 +1,23 @@
+# nzbforge scanner: pulls Usenet headers and builds releases (same image, same /data volume)
+[Unit]
+Description=nzbforge header scanner
+Wants=network-online.target
+After=network-online.target nzbforge.service
+
+[Container]
+ContainerName=nzbforge-scanner
+Image=ghcr.io/jwklijnsma/nzbforge:latest
+AutoUpdate=registry
+Network=nzbforge.network
+Volume=nzbforge-data.volume:/data:Z
+EnvironmentFile=%h/.config/nzbforge/nzbforge.env
+Exec=python -m app.scanner
+NoNewPrivileges=true
+
+[Service]
+Restart=always
+RestartSec=30
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

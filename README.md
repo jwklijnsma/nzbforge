@@ -18,6 +18,22 @@ cd ../frontend && npm install && npm run build           # UI is then served by 
 # or `npm run dev` for hot reload on :5173 (proxies to :8000)
 ```
 
+## Run with Podman + systemd (Quadlet)
+Units for Podman 4.4+ are in [`deploy/podman`](deploy/podman): `nzbforge` (API + UI on :8000) and `nzbforge-scanner`,
+sharing the `nzbforge-data` volume (SQLite in `/data`) and the `nzbforge` network.
+
+```bash
+git clone https://github.com/jwklijnsma/nzbforge && cd nzbforge/deploy/podman
+./install.sh                     # rootless: ~/.config/containers/systemd; use `sudo ./install.sh` for rootful
+$EDITOR ~/.config/nzbforge/nzbforge.env      # NNTP_* (ADMIN_KEY is generated)
+systemctl --user start nzbforge nzbforge-scanner
+loginctl enable-linger $USER     # start at boot / keep running after logout
+podman exec nzbforge python -m app.cli add-group alt.binaries.example
+journalctl --user -u nzbforge-scanner -f
+```
+The units carry `AutoUpdate=registry`, so `systemctl --user enable --now podman-auto-update.timer` keeps them on the latest release.
+If the GHCR package is private, run `podman login ghcr.io` first.
+
 ## Database Setup (MySQL/MariaDB)
 
 To use MySQL/MariaDB instead of the default SQLite:
