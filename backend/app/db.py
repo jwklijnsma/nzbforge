@@ -31,5 +31,5 @@ def _add_missing_columns():
             for col in table.columns:
                 if col.name not in have:
                     conn.execute(text(f"ALTER TABLE {table.name} ADD COLUMN {col.name} {col.type.compile(engine.dialect)}"))
-        for c in ("imdbid", "tvdbid", "tmdbid"):
+        for c in ("imdbid", "tvdbid", "tmdbid", "resolution", "source"):
             conn.execute(text(f"CREATE INDEX IF NOT EXISTS ix_releases_{c} ON releases ({c})"))

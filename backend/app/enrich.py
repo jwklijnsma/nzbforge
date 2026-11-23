@@ -10,7 +10,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 
 from .models import Release
 
@@ -45,7 +45,15 @@ def tvmaze(title, year=None):
         "rating": (d.get("rating") or {}).get("average"),
         "imdbid": ext.get("imdb"),
         "tvdbid": ext.get("thetvdb"),
+        "genres": ", ".join(d.get("genres") or []),
+        "website": d.get("url"),
     }
+
+
+TMDB_GENRES = {28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy", 80: "Crime", 99: "Documentary",
+               18: "Drama", 10751: "Family", 14: "Fantasy", 36: "History", 27: "Horror", 10402: "Music",
+               9648: "Mystery", 10749: "Romance", 878: "Science Fiction", 10770: "TV Movie", 53: "Thriller",
+               10752: "War", 37: "Western"}
 
 
 def tmdb_movie(title, year=None):
@@ -69,6 +77,8 @@ def tmdb_movie(title, year=None):
         "rating": round(m["vote_average"], 1) if m.get("vote_average") else None,
         "imdbid": imdb or None,
         "tmdbid": m["id"],
+        "genres": ", ".join(TMDB_GENRES[g] for g in m.get("genre_ids") or [] if g in TMDB_GENRES),
+        "website": f"https://www.themoviedb.org/movie/{m['id']}",
     }
 
 
@@ -79,7 +89,9 @@ def enrich_pending(db, limit=PER_PASS):
         cats.append(Release.category.between(2000, 2999))
     rows = db.scalars(
         select(Release)
-        .where(Release.enriched_at.is_(None), Release.title.is_not(None), or_(*cats))
+        .where(Release.title.is_not(None), or_(*cats),
+               # new releases, plus ones matched before genres were stored
+               or_(Release.enriched_at.is_(None), and_(Release.meta_title.is_not(None), Release.genres.is_(None))))
         .order_by(Release.posted.desc()).limit(limit)
     ).all()
     cache, found = {}, 0
@@ -99,6 +111,9 @@ def enrich_pending(db, limit=PER_PASS):
             for k, v in info.items():
                 if v not in (None, ""):
                     setattr(r, k, v)
+            r.genres = info.get("genres") or ""
+        if r.genres is None:
+            r.genres = ""  # looked up, none known (stops re-checking every pass)
         r.enriched_at = datetime.utcnow()
     db.commit()
     log.info("enrich: %d of %d releases matched", found, len(rows))

@@ -69,6 +69,19 @@ plus `python -m app.scanner`.
 2. When a collection is complete (or >= MIN_COMPLETION and idle 2h) it becomes a `Release`, classified into Newznab categories with season/episode parsed from the name.
 3. `/api?t=get` builds the NZB on the fly from the stored message-ids.
 
+## Spotweb-style interface
+![Spot list](docs/img/spots.png)
+
+- **Category tree** with counts (Movies, TV, Audio, PC/Games, Console, Ebooks, XXX, Other), plus quick filters for
+  language (Dutch audio or NL subs), resolution, source and age, and sorting by date, title, size, rating or grabs.
+- **Spot details parsed from the release name**: resolution, source (Remux/BluRay/WEB-DL/...), video codec, HDR/Dolby Vision,
+  audio (TrueHD Atmos, DTS-HD MA, DD+ ...), language, subtitles, edition (Extended, Repack ...), release group.
+  Genres and a website link come from TVmaze/TMDB. Existing releases are tagged automatically on start/scan.
+- **Send to NZBGet or SABnzbd** from the list or the spot view: set `DOWNLOADER=nzbget|sabnzbd`, `DOWNLOADER_URL`
+  and `DOWNLOADER_USER`/`DOWNLOADER_PASS` (NZBGet) or `DOWNLOADER_APIKEY` (SABnzbd). Categories default to
+  Movies/Series/Music/Software (NZBGet) or movies/tv/audio/software (SABnzbd); override with
+  `DOWNLOADER_CATEGORIES=2000=Movies,5000=Series`.
+
 ## Release information (Spotweb-style)
 - **Details panel**: click a release for poster, description, rating, file list with part counts, and the NFO.
 - **TV** metadata comes from TVmaze (no key needed). **Movies** use TMDB: set `TMDB_API_KEY` in `.env` (free key).
