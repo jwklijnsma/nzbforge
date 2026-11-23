@@ -7,10 +7,10 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from . import newznab as nz
-from . import scanner
+from . import downloader, scanner
 from .db import SessionLocal, init_db
 from .models import Group, Release, User
 from .nzb import build_nzb
@@ -25,6 +25,7 @@ async def lifespan(app: FastAPI):
             db.add(User(username="admin", api_key=key, is_admin=True))
             db.commit()
             print(f"[nzbforge] created admin user, API key: {key}")
+        scanner.tag_pending(db)  # Spotweb-style details for releases indexed before they existed
     stop = scanner.start_background() if scanner.enabled() else None
     yield
     if stop:
@@ -106,23 +107,58 @@ def admin_user(user: User = Depends(current_user)) -> User:
 
 @app.get("/web/me")
 def me(user: User = Depends(current_user)):
-    return {"username": user.username, "is_admin": user.is_admin}
+    return {"username": user.username, "is_admin": user.is_admin, "downloader": downloader.name()}
+
+
+INFO_FIELDS = ("resolution", "source", "video_codec", "hdr", "audio", "languages", "subtitles", "edition",
+               "release_group", "genres")
 
 
 def _summary(r: Release) -> dict:
     return {
         "guid": r.guid, "name": r.name, "category": r.category, "category_name": nz.cat_name(r.category),
         "size": r.size, "posted": r.posted.isoformat() + "Z", "grabs": r.grabs, "files": r.files,
-        "group": r.group_name, "title": r.meta_title or r.title, "year": r.year,
-        "poster_url": r.poster_url, "rating": r.rating,
+        "group": r.group_name, "poster": r.poster, "title": r.meta_title or r.title, "year": r.year,
+        "poster_url": r.poster_url, "rating": r.rating, "season": r.season, "episode": r.episode,
+        **{f: getattr(r, f) for f in INFO_FIELDS},
     }
 
 
+SORTS = {"date": Release.posted, "size": Release.size, "title": Release.searchname,
+         "rating": Release.rating, "grabs": Release.grabs}
+
+
 @app.get("/web/search")
-def web_search(q: str = "", cat: str = "", limit: int = 50, offset: int = 0,
+def web_search(q: str = "", cat: str = "", resolution: str = "", source: str = "", lang: str = "",
+               maxage: str = "", sort: str = "date", order: str = "desc", limit: int = 50, offset: int = 0,
                user: User = Depends(current_user), db=Depends(get_db)):
-    rows, total = nz.search(db, q=q, cat=cat, limit=to_int(limit, 50, 1, 100), offset=to_int(offset, 0))
+    conds = nz._conditions(db, q, cat, None, None, maxage)
+    if resolution:
+        conds.append(Release.resolution.in_(resolution.split(",")))
+    if source:
+        conds.append(Release.source.in_(source.split(",")))
+    if lang == "dutch":  # spoken Dutch or Dutch subtitles, like Spotweb's NL filter
+        conds.append(or_(Release.languages.like("%Dutch%"), Release.subtitles.like("%Dutch%")))
+    elif lang == "nlsubs":
+        conds.append(Release.subtitles.like("%Dutch%"))
+    col = SORTS.get(sort, Release.posted)
+    col = col.asc() if order == "asc" else col.desc()
+    total = db.scalar(select(func.count()).select_from(Release).where(*conds)) or 0
+    rows = db.scalars(select(Release).where(*conds).order_by(col.nulls_last(), Release.posted.desc())
+                      .limit(to_int(limit, 50, 1, 200)).offset(to_int(offset, 0))).all()
     return {"total": total, "items": [_summary(r) for r in rows]}
+
+
+@app.get("/web/categories")
+def web_categories(user: User = Depends(current_user), db=Depends(get_db)):
+    """Category tree with counts for the sidebar."""
+    counts = dict(db.execute(select(Release.category, func.count()).group_by(Release.category)).all())
+    tree = []
+    for pid, (pname, subs) in nz.CATS.items():
+        n = sum(v for k, v in counts.items() if pid <= k < pid + 1000)
+        tree.append({"id": pid, "name": pname, "count": n,
+                     "subs": [{"id": sid, "name": sn, "count": counts.get(sid, 0)} for sid, sn in subs.items()]})
+    return {"total": sum(counts.values()), "categories": tree}
 
 
 @app.get("/web/release/{guid}")
@@ -133,14 +169,28 @@ def web_release(guid: str, user: User = Depends(current_user), db=Depends(get_db
     return {
         **_summary(r),
         "title": r.meta_title or r.title or r.name,
-        "poster": r.poster, "season": r.season, "episode": r.episode,
         "overview": r.overview, "imdbid": r.imdbid, "tvdbid": r.tvdbid, "tmdbid": r.tmdbid, "nfo": r.nfo,
+        "website": r.website,
         "file_list": [
             {"name": fd["name"], "parts": len(fd["parts"]), "total": fd["total"],
              "size": sum(p[2] for p in fd["parts"])}
             for fd in r.files_data
         ],
     }
+
+
+@app.post("/web/release/{guid}/send")
+def send_to_downloader(guid: str, user: User = Depends(current_user), db=Depends(get_db)):
+    r = db.scalar(select(Release).where(Release.guid == guid))
+    if not r:
+        raise HTTPException(404, "No such release")
+    try:
+        downloader.send(build_nzb(r), r.name, r.category)
+    except Exception as e:
+        raise HTTPException(502, str(e))
+    r.grabs += 1
+    db.commit()
+    return {"ok": True, "downloader": downloader.name()}
 
 
 @app.get("/web/stats")

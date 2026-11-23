@@ -20,7 +20,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from .db import SessionLocal, init_db
 from .models import Collection, Group, Release
 from .enrich import enrich_pending
-from .parse import classify, extract_title, parse_subject, searchname
+from .parse import categorize, extract_title, file_exts, parse_subject, release_info, searchname
 
 log = logging.getLogger("scanner")
 HOST = os.getenv("NNTP_HOST", "")
@@ -167,19 +167,35 @@ def make_release(db, col, group_name):
     guid = hashlib.sha1(f"{group_name}|{col.poster}|{col.base}".encode()).hexdigest()
     if db.scalar(select(Release.id).where(Release.guid == guid)):
         return False
-    cat, season, episode = classify(col.base)
-    title, year = extract_title(col.base)
     files_data = [
         {"name": n, "total": f["total"],
          "parts": sorted([int(k), v[0], v[1]] for k, v in f["parts"].items())}
         for n, f in sorted(col.data.items())
     ]
+    cat, season, episode = categorize(col.base, file_exts(files_data))
+    title, year = extract_title(col.base)
     size = sum(p[2] for fd in files_data for p in fd["parts"])
     files = sum(1 for n in col.data if not n.lower().endswith(".par2")) or 1
     db.add(Release(guid=guid, name=col.base, searchname=searchname(col.base), group_name=group_name,
                    poster=col.poster, posted=col.posted, size=size, category=cat, season=season,
-                   episode=episode, files=files, files_data=files_data, title=title, year=year))
+                   episode=episode, files=files, files_data=files_data, title=title, year=year,
+                   info_at=datetime.utcnow(), **release_info(col.base)))
     return True
+
+
+def tag_pending(db, limit=5000):
+    """Fill the Spotweb-style details for releases indexed before they existed; re-check 'Other'."""
+    rows = db.scalars(select(Release).where(Release.info_at.is_(None)).limit(limit)).all()
+    for r in rows:
+        for k, v in release_info(r.name).items():
+            setattr(r, k, v)
+        if r.category == 7000:
+            r.category = categorize(r.name, file_exts(r.files_data))[0]
+        r.info_at = datetime.utcnow()
+    db.commit()
+    if rows:
+        log.info("details: tagged %d releases", len(rows))
+    return len(rows)
 
 
 def finalize(db):
@@ -301,6 +317,7 @@ def scan_pass():
                     db.rollback()
                     log.warning("%s: skipped (%s)", g.name, e)
             finalize(db)
+            tag_pending(db)
             enrich_pending(db)
             fetch_nfos(nntp, db)
     finally:

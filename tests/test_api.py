@@ -29,7 +29,7 @@ def test_web_me(client):
     assert client.get("/web/me").status_code == 401
     r = client.get("/web/me", headers={"X-Api-Key": ADMIN_KEY})
     assert r.status_code == 200
-    assert r.json() == {"username": "admin", "is_admin": True}
+    assert r.json() == {"username": "admin", "is_admin": True, "downloader": None}
 
 
 def test_groups_and_stats(client):

@@ -66,3 +66,17 @@ class Release(Base):
     nfo: Mapped[str | None] = mapped_column(Text, nullable=True)
     enriched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     nfo_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    genres: Mapped[str | None] = mapped_column(String(255), nullable=True)      # "Drama, Crime" (TVmaze/TMDB)
+    website: Mapped[str | None] = mapped_column(String(512), nullable=True)     # TVmaze/TMDB page
+
+    # Spotweb-style details parsed from the name (parse.release_info)
+    resolution: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    source: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    video_codec: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    hdr: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    audio: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    languages: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    subtitles: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    edition: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    release_group: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    info_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

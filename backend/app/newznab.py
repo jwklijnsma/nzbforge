@@ -8,10 +8,13 @@ from .models import Release
 from .parse import searchname
 
 CATS = {
+    1000: ("Console", {}),
     2000: ("Movies", {2030: "SD", 2040: "HD", 2045: "UHD"}),
-    3000: ("Audio", {3010: "MP3", 3040: "Lossless"}),
+    3000: ("Audio", {3010: "MP3", 3030: "Audiobook", 3040: "Lossless"}),
+    4000: ("PC", {4030: "Mac", 4050: "Games"}),
     5000: ("TV", {5030: "SD", 5040: "HD", 5045: "UHD"}),
-    7000: ("Other", {}),
+    6000: ("XXX", {}),
+    7000: ("Other", {7020: "Ebook"}),
 }
 TITLE = "nzbforge"
 
