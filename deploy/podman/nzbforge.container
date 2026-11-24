@@ -12,9 +12,10 @@ Network=nzbforge.network
 Volume=nzbforge-data.volume:/data:Z
 EnvironmentFile=%h/.config/nzbforge/nzbforge.env
 PublishPort=8000:8000
-HealthCmd=python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api?t=caps', timeout=5)"
+HealthCmd=python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api?t=caps', timeout=15)"
 HealthInterval=60s
-HealthStartPeriod=20s
+HealthRetries=5
+HealthStartPeriod=120s
 HealthOnFailure=kill
 NoNewPrivileges=true
 

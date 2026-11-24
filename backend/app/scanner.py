@@ -7,6 +7,8 @@ import fnmatch
 import hashlib
 import logging
 import os
+import queue
+import select as selectmod
 import socket
 import ssl
 import threading
@@ -40,6 +42,8 @@ NFO_PER_PASS = int(os.getenv("NFO_PER_PASS", "100"))
 CONNECTIONS = max(1, int(os.getenv("NNTP_CONNECTIONS", "8")))       # parallel connections for XOVER/BODY
 COMPRESS = os.getenv("NNTP_COMPRESS", "1") == "1"                    # XFEATURE COMPRESS GZIP when offered
 POSTPROCESS_EVERY = int(os.getenv("POSTPROCESS_EVERY", "300"))       # build releases/metadata during long pulls
+CONNECT_TIMEOUT = int(os.getenv("NNTP_CONNECT_TIMEOUT", "30"))       # seconds for connect + greeting
+READ_TIMEOUT = int(os.getenv("NNTP_TIMEOUT", "60"))                  # seconds without data before a read fails
 
 
 # ---------- live job status (read by GET /web/jobs) ----------
@@ -74,29 +78,121 @@ def status() -> dict:
     return snap
 
 
+class Reader:
+    """Buffered socket reader that never blocks unless asked to (a stuck read can't freeze a pass)."""
+
+    def __init__(self, sock):
+        self.sock, self.buf, self.pos = sock, bytearray(), 0
+
+    def _fill(self):
+        data = self.sock.recv(262144)
+        if not data:
+            return False
+        if self.pos > 1 << 20:  # compact now and then instead of on every read
+            del self.buf[:self.pos]
+            self.pos = 0
+        self.buf += data
+        return True
+
+    def buffered(self):
+        return len(self.buf) - self.pos
+
+    def readline(self):
+        while True:
+            i = self.buf.find(b"\n", self.pos)
+            if i >= 0:
+                line = bytes(self.buf[self.pos:i + 1])
+                self.pos = i + 1
+                return line
+            if not self._fill():
+                raise EOFError("connection closed")
+
+    def peek(self, n=1):
+        while self.buffered() < n:
+            if not self._fill():
+                break
+        return bytes(self.buf[self.pos:self.pos + n])
+
+    def read1(self, n=262144):
+        if not self.buffered() and not self._fill():
+            return b""
+        out = bytes(self.buf[self.pos:self.pos + n])
+        self.pos += len(out)
+        return out
+
+    def until(self, marker, start_marker=None):
+        """Bytes up to and including `marker` (the dot-terminated end of a multi-line reply)."""
+        if start_marker is not None and self.peek(len(start_marker)) == start_marker:  # empty reply
+            self.pos += len(start_marker)
+            return b""
+        search = self.pos
+        while True:
+            i = self.buf.find(marker, search)
+            if i >= 0:
+                out = bytes(self.buf[self.pos:i + 2])  # keep the last line's CRLF
+                self.pos = i + len(marker)
+                return out
+            search = max(self.pos, len(self.buf) - len(marker))
+            if not self._fill():
+                raise EOFError("connection closed inside a multi-line reply")
+
+    def ready(self, timeout):
+        """True when more bytes can be read without waiting longer than `timeout`."""
+        if self.buffered() or (hasattr(self.sock, "pending") and self.sock.pending()):
+            return True
+        return bool(selectmod.select([self.sock], [], [], timeout)[0])
+
+    def drain(self, timeout=0.3):
+        """Throw away anything the server still sends for the previous reply (bounded wait)."""
+        dropped = b""
+        while self.ready(timeout) and len(dropped) < 65536:
+            chunk = self.read1(65536)
+            if not chunk:
+                break
+            dropped += chunk
+        return dropped
+
+
+def _lines(blob: bytes):
+    out = []
+    for line in blob.split(b"\r\n"):
+        if line.startswith(b".."):
+            line = line[1:]
+        out.append(line)
+    if out and out[-1] == b"":
+        out.pop()
+    return out
+
+
 class NNTP:
     """Minimal NNTP client (nntplib was removed in Python 3.13)."""
 
-    def __init__(self, host, port, user, password, use_ssl=True):
-        raw = socket.create_connection((host, port), timeout=120)
+    compressed = False
+
+    def __init__(self, host, port, user, password, use_ssl=True, compress=None):
+        raw = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
         self.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host) if use_ssl else raw
-        self.f = self.sock.makefile("rb")
-        self._status()  # greeting
+        self.r = Reader(self.sock)
+        code, msg = self._status()  # greeting
+        if code not in (200, 201):
+            self.sock.close()
+            # e.g. 400/502 "too many connections": the provider's connection limit is reached
+            raise ConnectionRefusedError(f"server refused connection: {code} {msg}")
+        self.sock.settimeout(READ_TIMEOUT)
         if user:
             code, _ = self.cmd(f"AUTHINFO USER {user}")
             if code == 381:
                 code, _ = self.cmd(f"AUTHINFO PASS {password}")
             if code != 281:
                 raise RuntimeError("NNTP authentication failed")
-        if COMPRESS:
+        if COMPRESS if compress is None else compress:
             # Highwinds/Giganews style header compression; servers without it just answer 500
             code, _ = self.cmd("XFEATURE COMPRESS GZIP")
             self.compressed = code == 290
 
-    compressed = False
-
     def close(self):
         try:
+            self.sock.settimeout(5)
             self.cmd("QUIT")
         except Exception:
             pass
@@ -106,22 +202,20 @@ class NNTP:
             pass
 
     def _status(self):
-        line = self.f.readline().decode("utf-8", "replace").strip()
+        line = self.r.readline().decode("utf-8", "replace").strip()
+        if len(line) < 3 or not line[:3].isdigit():
+            raise EOFError(f"unexpected reply: {line[:80]!r}")
         return int(line[:3]), line[4:]
 
     def cmd(self, c):
         self.sock.sendall((c + "\r\n").encode())
         return self._status()
 
+    def _multiline_bytes(self):
+        return _lines(self.r.until(b"\r\n.\r\n", start_marker=b".\r\n"))
+
     def _multiline(self):
-        lines = []
-        while True:
-            line = self.f.readline()
-            if not line or line == b".\r\n":
-                return lines
-            if line.startswith(b".."):
-                line = line[1:]
-            lines.append(line.rstrip(b"\r\n").decode("utf-8", "replace"))
+        return [line.decode("utf-8", "replace") for line in self._multiline_bytes()]
 
     def group(self, name):
         code, msg = self.cmd(f"GROUP {name}")
@@ -135,35 +229,42 @@ class NNTP:
         if code != 224:
             raise RuntimeError(f"XOVER: {code} {msg}")
         # Overview lines start with an article number; a zlib (0x78) or gzip (0x1f) byte means compressed.
-        first = self.f.peek(1)[:1]
-        if first in (b"\x78", b"\x1f"):
+        if self.r.peek(1) in (b"\x78", b"\x1f"):
             return self._compressed_multiline()
         return self._multiline()
 
     def _compressed_multiline(self):
-        """zlib/gzip stream followed by '.\\r\\n'; inside it the usual dot-terminated lines."""
+        """zlib/gzip stream (usually followed by '.\\r\\n'); inside it the usual dot-terminated lines.
+
+        Providers differ in how they end it: a closed stream plus '.\\r\\n', a closed stream only, or a
+        flushed-but-open stream whose text already ends in '\\r\\n.\\r\\n'. All three are handled without
+        waiting for bytes that may never come.
+        """
         d = zlib.decompressobj(47)  # auto-detect zlib or gzip header
-        out = []
+        out = bytearray()
         while not d.eof:
-            chunk = self.f.read1(262144)
+            if (out.endswith(b"\r\n.\r\n") or out == b".\r\n") and not self.r.ready(0.3):
+                break  # whole listing received and nothing more coming: the stream was only flushed
+            chunk = self.r.read1(262144)
             if not chunk:
                 raise EOFError("connection closed inside compressed XOVER")
-            out.append(d.decompress(chunk))
-        tail = d.unused_data
-        while not tail.endswith(b".\r\n"):
-            more = self.f.read1(64)
-            if not more:
+            out += d.decompress(chunk)
+        if d.eof and d.unused_data:  # bytes read past the end of the stream: put them back
+            self.r.buf[self.r.pos:self.r.pos] = d.unused_data
+        # The usual '.\\r\\n' after the stream: take it if it is there or arrives within 0.3 s, never block.
+        term = b".\r\n"
+        while self.r.buffered() < 3 and term.startswith(bytes(self.r.buf[self.r.pos:])) and self.r.ready(0.3):
+            if not self.r._fill():
                 break
-            tail += more
-        lines = []
-        for line in b"".join(out).split(b"\r\n"):
-            if line == b".":
-                break
-            if line.startswith(b".."):
-                line = line[1:]
-            if line:
-                lines.append(line.decode("utf-8", "replace"))
-        return lines
+        have = bytes(self.r.buf[self.r.pos:self.r.pos + 3])
+        if have and term.startswith(have):
+            self.r.pos += len(have)
+        text = bytes(out)
+        if text.endswith(b"\r\n.\r\n"):
+            text = text[:-3]
+        elif text == b".\r\n":
+            text = b""
+        return [line.decode("utf-8", "replace") for line in _lines(text)]
 
     def list_active(self, pattern="*"):
         """[(name, first, last, flag)] from LIST ACTIVE (falls back to plain LIST)."""
@@ -182,69 +283,92 @@ class NNTP:
                     continue
         return out
 
-    def _raw_multiline(self):
-        lines = []
-        while True:
-            line = self.f.readline()
-            if not line or line == b".\r\n":
-                return lines
-            if line.startswith(b".."):
-                line = line[1:]
-            lines.append(line.rstrip(b"\r\n"))
-
     def body(self, msgid):
         code, _ = self.cmd(f"BODY <{msgid.strip('<>')}>")
-        return self._raw_multiline() if code == 222 else None
-
-
+        return self._multiline_bytes() if code == 222 else None
 
 
 class Pool:
-    """NNTP connections, one per worker thread, kept open for the whole pass.
+    """Up to NNTP_CONNECTIONS connections shared by worker threads for one pass.
 
-    Fetches run on the workers while the caller saves the previous batch, so the
-    network never waits for the database (and vice versa).
+    Fetches run on the workers while the caller saves the previous batch. If the provider refuses
+    connections (its limit, or the downloader uses them), the pool carries on with the ones it has.
+    If compressed headers fail, compression is switched off and the request is retried.
     """
 
     def __init__(self, size=None):
         self.size = size or CONNECTIONS
-        self._local = threading.local()
-        self._conns = []
+        self.limit = self.size
+        self.compress = COMPRESS
+        self.compressed = False
+        self._idle = queue.LifoQueue()
+        self._open = 0
+        self._all = []
         self._lock = threading.Lock()
         self.executor = ThreadPoolExecutor(self.size, thread_name_prefix="nntp")
-        self.compressed = False
 
-    def _conn(self):
-        c = getattr(self._local, "conn", None)
-        if c is None:
-            c = NNTP(HOST, PORT, USER, PASS, USE_SSL)
-            self._local.conn, self._local.group = c, None
+    def _acquire(self):
+        while True:
+            try:
+                return self._idle.get_nowait()
+            except queue.Empty:
+                pass
             with self._lock:
-                self._conns.append(c)
-                self.compressed = self.compressed or getattr(c, "compressed", False)
-        return c
+                opening = self._open < self.limit
+                if opening:
+                    self._open += 1
+            if opening:
+                try:
+                    c = NNTP(HOST, PORT, USER, PASS, USE_SSL, compress=self.compress)
+                except Exception as e:
+                    with self._lock:
+                        self._open -= 1
+                        others = self._open
+                        if others:
+                            self.limit = others
+                    if not others:
+                        raise
+                    log.warning("could not open another connection (%s); continuing with %d", e, others)
+                    continue
+                c.current_group = None
+                with self._lock:
+                    self._all.append(c)
+                    self.compressed = self.compressed or getattr(c, "compressed", False)
+                return c
+            try:
+                return self._idle.get(timeout=1)
+            except queue.Empty:
+                continue
 
-    def _drop(self):
-        c = getattr(self._local, "conn", None)
-        self._local.conn = None
-        if c is not None:
-            with self._lock:
-                if c in self._conns:
-                    self._conns.remove(c)
-            c.close()
+    def _discard(self, c):
+        with self._lock:
+            self._open -= 1
+            if c in self._all:
+                self._all.remove(c)
+        c.close()
 
     def _call(self, fn, group=None):
-        for attempt in (1, 2):  # one reconnect on a dropped connection
+        for attempt in (1, 2):
+            c = self._acquire()
             try:
-                c = self._conn()
-                if group and self._local.group != group:
+                if group and c.current_group != group:
                     c.group(group)
-                    self._local.group = group
-                return fn(c)
-            except (OSError, EOFError, ValueError):
-                self._drop()
+                    c.current_group = group
+                out = fn(c)
+            except RuntimeError:
+                self._idle.put(c)  # NNTP error reply (e.g. 411 no such group): connection is fine
+                raise
+            except (OSError, EOFError, ValueError, zlib.error) as e:
+                self._discard(c)
+                decode_error = isinstance(e, (EOFError, ValueError, zlib.error))  # not plain timeouts/resets
+                if decode_error and getattr(c, "compressed", False) and self.compress:
+                    self.compress = False
+                    log.warning("compressed headers failed (%s); switching compression off", e)
                 if attempt == 2:
                     raise
+                continue
+            self._idle.put(c)
+            return out
 
     def submit(self, fn, group=None):
         return self.executor.submit(self._call, fn, group)
@@ -262,13 +386,16 @@ class Pool:
     def body(self, msgid):
         return self.submit(lambda c: c.body(msgid))
 
+    def connections(self):
+        with self._lock:
+            return self._open
+
     def close(self):
         self.executor.shutdown(wait=True, cancel_futures=True)
         with self._lock:
-            conns, self._conns = self._conns, []
+            conns, self._all = self._all, []
         for c in conns:
             c.close()
-
 
 def parse_date(s):
     try:
@@ -525,18 +652,26 @@ def scan_pass(only=None):
             q = q.where(Group.name.in_(only)) if only else q.where(Group.active)
             groups = db.scalars(q).all()
             last_post = time.monotonic()
+            net_fails = 0
             for i, g in enumerate(groups, 1):
                 _set("scanner", state="scanning", group=g.name, group_index=i, group_count=len(groups),
                      article=0, article_from=0, article_to=0)
                 try:
                     summary["headers"] += scan_group(pool, db, g) or 0
                     summary["groups"] += 1
-                except RuntimeError as e:  # NNTP error for this group only; keep going
+                    net_fails = 0
+                except (RuntimeError, OSError, EOFError) as e:  # this group only; keep going
                     db.rollback()
-                    g.last_error = str(e)[:255]
+                    msg = f"{type(e).__name__}: {e}" if isinstance(e, (OSError, EOFError)) else str(e)
+                    g.last_error = msg[:255]
                     db.commit()
-                    summary["errors"].append(f"{g.name}: {e}")
-                    log.warning("%s: skipped (%s)", g.name, e)
+                    summary["errors"].append(f"{g.name}: {msg}")
+                    log.warning("%s: skipped (%s)", g.name, msg)
+                    if not isinstance(e, RuntimeError):
+                        net_fails += 1
+                        if net_fails >= 3:  # the server itself is unreachable: stop this pass
+                            raise
+                _set("scanner", connections=pool.connections(), compressed=pool.compressed and pool.compress)
                 with _lock:
                     _requested.discard(g.name)
                 if i < len(groups) and time.monotonic() - last_post > POSTPROCESS_EVERY:
@@ -544,7 +679,7 @@ def scan_pass(only=None):
                     last_post = time.monotonic()
             _postprocess(pool, db, summary)
     except Exception as e:
-        summary["errors"].append(str(e))
+        summary["errors"].append(f"{type(e).__name__}: {e}")
         raise
     finally:
         pool.close()

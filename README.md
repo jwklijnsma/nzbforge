@@ -33,8 +33,10 @@ journalctl --user -u nzbforge -f
 The units carry `AutoUpdate=registry`, so `systemctl --user enable --now podman-auto-update.timer` keeps them on the latest release.
 If the GHCR package is private, run `podman login ghcr.io` first.
 
-The unit restarts the container when its health check (`/api?t=caps`) fails 3 times in a row. While troubleshooting
-you can turn that off with `HealthOnFailure=none` in `nzbforge.container`, then `systemctl daemon-reload`.
+The unit restarts the container when its health check (`/api?t=caps`) fails 5 times in a row (after a 2-minute start
+period). While troubleshooting you can turn that off with `HealthOnFailure=none` in `nzbforge.container`, then
+`systemctl daemon-reload`. If the web server ever stops answering for 30 seconds, nzbforge writes the stack of every
+thread to the log (`podman logs nzbforge`), which shows where it is stuck.
 
 ## Configuration
 All settings are environment variables. Put them in `backend/.env` (manual install) or in the env file the Podman
@@ -57,7 +59,9 @@ In the Podman env file, don't put quotes or comments after a value. After a chan
 | `NNTP_SSL` | `1` | `1` = SSL/TLS, `0` = plain text. |
 | `NNTP_USER` / `NNTP_PASS` | – | Your provider login. |
 | `NNTP_CONNECTIONS` | `8` | Parallel connections for headers and NFOs. Keep the total of nzbforge **plus your downloader** under your provider's connection limit. |
-| `NNTP_COMPRESS` | `1` | Ask for compressed headers (`XFEATURE COMPRESS GZIP`). Providers without it are detected automatically. Set `0` to switch it off. |
+| `NNTP_TIMEOUT` | `60` | Seconds a connection may stay silent before the request is retried on a fresh connection. |
+| `NNTP_CONNECT_TIMEOUT` | `30` | Seconds to connect and get the server's greeting. A refused connection (e.g. *502 too many connections*) makes nzbforge continue with the connections it already has. |
+| `NNTP_COMPRESS` | `1` | Ask for compressed headers (`XFEATURE COMPRESS GZIP`). Providers without it are detected automatically, and if compressed replies can't be decoded it is switched off for the rest of the pull. Set `0` to switch it off. |
 
 ### Scanning
 | Option | Default | What it does |

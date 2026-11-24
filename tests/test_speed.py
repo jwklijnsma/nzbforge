@@ -1,4 +1,6 @@
 import io
+
+from conftest import ByteSock, fake_conn
 import threading
 import time
 import zlib
@@ -22,32 +24,64 @@ class FakeSock:
         pass
 
 
-@pytest.mark.parametrize("wbits", [zlib.MAX_WBITS, 31])  # zlib and gzip
-def test_compressed_xover(wbits):
-    lines = overview(1, 300)
+def _compressed(lines, wbits=zlib.MAX_WBITS, close=True):
     payload = ("\r\n".join(lines) + "\r\n.\r\n").encode()
     c = zlib.compressobj(wbits=wbits)
-    blob = c.compress(payload) + c.flush()
-    n = RealNNTP.__new__(RealNNTP)
-    n.sock = FakeSock()
-    n.f = io.BufferedReader(io.BytesIO(b"224 compressed data follows\r\n" + blob + b".\r\n"))
+    return c.compress(payload) + (c.flush() if close else c.flush(zlib.Z_SYNC_FLUSH))
+
+
+@pytest.mark.parametrize("wbits", [zlib.MAX_WBITS, 31])  # zlib and gzip
+@pytest.mark.parametrize("chunk", [7, 4096])                # tiny reads: terminator split over reads
+def test_compressed_xover_with_terminator(wbits, chunk):
+    lines = overview(1, 300)
+    n = fake_conn(b"224 compressed data follows\r\n" + _compressed(lines, wbits) + b".\r\n"
+                  + b"211 next\r\n", chunk=chunk)
     assert n.xover(1, 300) == lines
-    assert n.f.read() == b""  # the trailing ".\r\n" was consumed too
+    assert n._status() == (211, "next")  # positioned exactly after the terminator
 
 
-def test_plain_xover_still_works():
+def test_compressed_xover_without_terminator_does_not_hang():
+    lines = overview(1, 50)
+    # closed stream, no '.\\r\\n' after it, and the server goes quiet (would time out after 60 s before)
+    n = fake_conn(b"224 ok\r\n" + _compressed(lines), silent_after=True)
+    t = time.monotonic()
+    assert n.xover(1, 50) == lines
+    assert time.monotonic() - t < 1
+
+
+def test_flushed_open_stream_is_complete():
+    lines = overview(1, 50)
+    n = fake_conn(b"224 ok\r\n" + _compressed(lines, close=False), silent_after=True)
+    assert n.xover(1, 50) == lines
+
+
+def test_plain_xover_and_empty_reply():
     lines = overview(1, 3)
-    n = RealNNTP.__new__(RealNNTP)
-    n.sock = FakeSock()
-    n.f = io.BufferedReader(io.BytesIO(("224 ok\r\n" + "\r\n".join(lines) + "\r\n.\r\n").encode()))
+    n = fake_conn(("224 ok\r\n" + "\r\n".join(lines) + "\r\n.\r\n224 ok\r\n.\r\n").encode(), chunk=5)
     assert n.xover(1, 3) == lines
+    assert n.xover(4, 9) == []
+
+
+def test_body_unescapes_dots():
+    n = fake_conn(b"222 body\r\n=ybegin\r\n..dot line\r\nend\r\n.\r\n")
+    assert n.body("<x@y>") == [b"=ybegin", b".dot line", b"end"]
+
+
+def test_refused_greeting_raises(monkeypatch):
+    class S(ByteSock):
+        def close(self):
+            pass
+
+    monkeypatch.setattr(scanner.socket, "create_connection", lambda *a, **k: S(b"502 too many connections\r\n"))
+    with pytest.raises(ConnectionRefusedError, match="502"):
+        RealNNTP("h", 119, "", "", use_ssl=False)
 
 
 class FakeNNTP:
     """Slow fake server connection: records which thread served which range."""
     made = []
 
-    def __init__(self, *a):
+    def __init__(self, *a, **k):
         self.group_name = None
         self.compressed = False
         FakeNNTP.made.append(self)
@@ -84,7 +118,7 @@ def test_parallel_pipelined_scan(client, monkeypatch):
             pool.close()
         took = time.monotonic() - t
         assert got == 10_000 and g.last_article == 10_000
-        assert len({c for c in FakeNNTP.made if c.calls}) == 4  # all four connections did work
+        assert len([c for c in FakeNNTP.made if c.calls]) == 4  # all four connections did work
         assert took < 20 * 0.05  # 20 batches of 50 ms would take >= 1 s on one connection
 
 
@@ -130,3 +164,43 @@ def test_enrich_reuses_known_titles_and_caches(client, monkeypatch):
         assert calls == ["Speedshow"]
         r = db.scalar(scanner.select(Release).where(Release.guid == "e3"))
         assert r.meta_title == "Speedshow" and r.genres == "Drama"
+
+
+def test_pool_continues_when_provider_refuses_more_connections(monkeypatch):
+    class Limited(FakeNNTP):
+        def __init__(self, *a, **k):
+            if len(FakeNNTP.made) >= 2:
+                raise ConnectionRefusedError("server refused connection: 502 too many connections")
+            super().__init__(*a, **k)
+
+    FakeNNTP.made = []
+    monkeypatch.setattr(scanner, "NNTP", Limited)
+    pool = scanner.Pool(6)
+    try:
+        futs = [pool.xover("alt.binaries.speed", x, x + 9) for x in range(1, 200, 10)]
+        assert sum(len(f.result()) for f in futs) == 200
+        assert pool.connections() == 2 and pool.limit == 2
+    finally:
+        pool.close()
+
+
+def test_compression_switched_off_after_failure(monkeypatch):
+    class Broken(FakeNNTP):
+        def __init__(self, *a, compress=None, **k):
+            super().__init__(*a, **k)
+            self.compressed = bool(compress)
+
+        def xover(self, a, b):
+            if self.compressed:
+                raise zlib.error("bad stream")
+            return super().xover(a, b)
+
+    FakeNNTP.made = []
+    monkeypatch.setattr(scanner, "NNTP", Broken)
+    pool = scanner.Pool(1)
+    pool.compress = True
+    try:
+        assert len(pool.xover("alt.binaries.speed", 1, 5).result()) == 5
+        assert pool.compress is False
+    finally:
+        pool.close()
