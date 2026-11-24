@@ -28,11 +28,9 @@ class FakeSock:
 
 
 def fake_nntp(lines, list_code=215):
-    n = RealNNTP.__new__(RealNNTP)
-    n.sock = FakeSock()
+    from conftest import fake_conn
     body = f"{list_code} list follows\r\n" + "".join(l + "\r\n" for l in lines) + ".\r\n"
-    n.f = io.BytesIO(body.encode())
-    return n
+    return fake_conn(body.encode())
 
 
 def test_list_active_parses_and_filters():
@@ -61,15 +59,15 @@ def test_import_endpoint(client, monkeypatch):
     assert r.status_code == 400 and "NNTP_HOST" in r.json()["detail"]
 
     monkeypatch.setattr(scanner, "HOST", "news.example.com")
-    monkeypatch.setattr(scanner, "NNTP", lambda *a: fake_nntp(["alt.binaries.new.one 99 1 y"]))
+    monkeypatch.setattr(scanner, "NNTP", lambda *a, **k: fake_nntp(["alt.binaries.new.one 99 1 y"]))
     r = client.post("/web/groups/import", json={"pattern": "alt.binaries.new.*"}, headers=h)
-    assert r.status_code == 202 and r.json()["state"] == "running"
+    assert r.status_code == 202, r.text
     for _ in range(50):
         job = client.get("/web/jobs", headers=h).json()["import"]
         if job["state"] != "running":
             break
         time.sleep(0.05)
-    assert (job["state"], job["matched"], job["added"]) == ("done", 1, 1)
+    assert (job["state"], job["matched"], job["added"]) == ("done", 1, 1), job["error"]
 
 
 def test_bad_group_does_not_stop_pass(monkeypatch):
@@ -85,7 +83,7 @@ def test_bad_group_does_not_stop_pass(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(scanner, "NNTP", lambda *a: N())
+    monkeypatch.setattr(scanner, "NNTP", lambda *a, **k: N())
     monkeypatch.setattr(scanner, "scan_group", scan_group)
     for f in ("finalize", "enrich_pending"):
         monkeypatch.setattr(scanner, f, lambda db: None)

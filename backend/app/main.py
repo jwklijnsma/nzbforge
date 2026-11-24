@@ -1,3 +1,5 @@
+import asyncio
+import faulthandler
 import os
 import secrets
 from contextlib import asynccontextmanager
@@ -16,6 +18,17 @@ from .models import Collection, Group, Release, User
 from .nzb import build_nzb
 
 
+async def _watchdog(stall=30):
+    """If the web server stops answering for `stall` seconds, write every thread's stack to the log.
+
+    faulthandler's timer runs in C, so it fires even when Python itself is stuck.
+    """
+    faulthandler.enable()
+    while True:
+        faulthandler.dump_traceback_later(stall, repeat=False)
+        await asyncio.sleep(5)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -27,7 +40,10 @@ async def lifespan(app: FastAPI):
             print(f"[nzbforge] created admin user, API key: {key}")
         scanner.tag_pending(db)  # Spotweb-style details for releases indexed before they existed
     stop = scanner.start_background() if scanner.enabled() else None
+    watchdog = asyncio.create_task(_watchdog())
     yield
+    watchdog.cancel()
+    faulthandler.cancel_dump_traceback_later()
     if stop:
         stop.set()
         scanner.wake()
