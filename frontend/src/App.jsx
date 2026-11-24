@@ -438,7 +438,9 @@ function ScannerCard({ api, jobs, setJobs, hasGroups }) {
           </p>
           <p className="count small">All groups: {Math.round(overall * 100)}%</p>
           <Bar value={overall} label="All groups" />
-          <p className="count small">{num(sc.headers)} headers this pull · started {fmtAgo(sc.started)}</p>
+          <p className="count small">
+            {num(sc.headers)} headers this pull{sc.rate ? ` · ${num(sc.rate)} headers/s` : ""} · {sc.connections} connection{sc.connections === 1 ? "" : "s"}{sc.compressed ? " · compressed" : ""} · started {fmtAgo(sc.started)}
+          </p>
         </>
       )}
       {busy && sc.state !== "scanning" && (<><p>{sc.state.charAt(0).toUpperCase() + sc.state.slice(1)}…</p><Bar value={null} label={sc.state} /></>)}
