@@ -4,10 +4,12 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from sqlalchemy import and_, or_, select
@@ -16,13 +18,45 @@ from .models import Release
 
 log = logging.getLogger("enrich")
 TMDB_KEY = os.getenv("TMDB_API_KEY", "")
-PER_PASS = int(os.getenv("ENRICH_PER_PASS", "200"))
+PER_PASS = int(os.getenv("ENRICH_PER_PASS", "1000"))
+WORKERS = int(os.getenv("ENRICH_WORKERS", "4"))
+CACHE_HOURS = 12
+FIELDS = ("meta_title", "year", "overview", "poster_url", "rating", "imdbid", "tvdbid", "tmdbid", "genres", "website")
+
+
+class _Rate:
+    """Spaces requests to one site so parallel workers stay inside its rate limit."""
+
+    def __init__(self, per_second):
+        self.interval, self.next, self.lock = 1 / per_second, 0.0, threading.Lock()
+
+    def wait(self):
+        with self.lock:
+            now = time.monotonic()
+            at = max(now, self.next)
+            self.next = at + self.interval
+        time.sleep(max(0.0, at - now))
+
+
+RATES = {"api.tvmaze.com": _Rate(2), "api.themoviedb.org": _Rate(20)}  # TVmaze: 20 calls / 10 s
+_cache: dict = {}  # (kind, title, year) -> (time, info or None), kept between passes
+_cache_lock = threading.Lock()
 
 
 def _get(url):
+    rate = RATES.get(urllib.parse.urlsplit(url).hostname)
     req = urllib.request.Request(url, headers={"User-Agent": "nzbforge/0.1", "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return json.load(r)
+    for attempt in (1, 2):
+        if rate:
+            rate.wait()
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt == 1:  # rate limited: wait as asked, then retry once
+                time.sleep(min(10.0, float(e.headers.get("Retry-After") or 2)))
+                continue
+            raise
 
 
 def _clean(s):
@@ -82,8 +116,28 @@ def tmdb_movie(title, year=None):
     }
 
 
+def _lookup(key):
+    kind, title, year = key
+    return tvmaze(title, year) if kind == "tv" else tmdb_movie(title, year)
+
+
+def _known(db, kind, title, year):
+    """Metadata another release with the same title already got (e.g. earlier episodes): no web lookup."""
+    cats = Release.category.between(5000, 5999) if kind == "tv" else Release.category.between(2000, 2999)
+    q = select(Release).where(cats, Release.title == title, Release.meta_title.is_not(None),
+                              Release.genres.is_not(None))
+    if kind == "movie" and year:
+        q = q.where(Release.year == year)
+    r = db.scalar(q.order_by(Release.enriched_at.desc()).limit(1))
+    return {f: getattr(r, f) for f in FIELDS} if r else None
+
+
 def enrich_pending(db, limit=PER_PASS):
-    """Look up TV/movie releases that have no metadata yet. Lookups are cached per title for the pass."""
+    """Look up TV/movie releases without metadata.
+
+    Order of preference: in-memory cache (kept between passes), metadata an earlier release with the
+    same title already has, and only then TVmaze/TMDB, in parallel within each site's rate limit.
+    """
     cats = [Release.category.between(5000, 5999)]
     if TMDB_KEY:
         cats.append(Release.category.between(2000, 2999))
@@ -94,26 +148,57 @@ def enrich_pending(db, limit=PER_PASS):
                or_(Release.enriched_at.is_(None), and_(Release.meta_title.is_not(None), Release.genres.is_(None))))
         .order_by(Release.posted.desc()).limit(limit)
     ).all()
-    cache, found = {}, 0
-    for r in rows:
+    if not rows:
+        return 0
+
+    def key_of(r):
         kind = "tv" if r.category >= 5000 else "movie"
-        key = (kind, r.title.lower(), r.year)
-        if key not in cache:
-            try:
-                cache[key] = tvmaze(r.title, r.year) if kind == "tv" else tmdb_movie(r.title, r.year)
-            except Exception as e:  # network/rate limit: leave pending, try next pass
-                log.warning("lookup failed for %r: %s", r.title, e)
-                continue
-            time.sleep(0.5)
-        info = cache[key]
+        return kind, r.title, r.year if kind == "movie" else None  # a show's year is its premiere, not the file's
+
+    results, now = {}, time.time()
+    with _cache_lock:
+        for k, (t, info) in list(_cache.items()):
+            if now - t > CACHE_HOURS * 3600:
+                del _cache[k]
+    for r in rows:
+        k = key_of(r)
+        if k in results:
+            continue
+        with _cache_lock:
+            hit = _cache.get((k[0], k[1].lower(), k[2]))
+        if hit:
+            results[k] = hit[1]
+        elif (info := _known(db, *k)) is not None:
+            results[k] = info
+    todo = [k for k in {key_of(r) for r in rows} if k not in results]
+    web = 0
+    if todo:
+        with ThreadPoolExecutor(WORKERS, thread_name_prefix="enrich") as ex:
+            for k, fut in [(k, ex.submit(_lookup, k)) for k in todo]:
+                try:
+                    results[k] = fut.result()
+                    web += 1
+                except Exception as e:  # network/rate limit: leave pending, try next pass
+                    log.warning("lookup failed for %r: %s", k[1], e)
+                    continue
+                with _cache_lock:
+                    _cache[(k[0], k[1].lower(), k[2])] = (now, results[k])
+
+    found = 0
+    for r in rows:
+        k = key_of(r)
+        if k not in results:
+            continue  # lookup failed; stays pending
+        info = results[k]
         if info:
             found += 1
-            for k, v in info.items():
+            for f, v in info.items():
                 if v not in (None, ""):
-                    setattr(r, k, v)
+                    setattr(r, f, v)
             r.genres = info.get("genres") or ""
         if r.genres is None:
             r.genres = ""  # looked up, none known (stops re-checking every pass)
         r.enriched_at = datetime.utcnow()
     db.commit()
-    log.info("enrich: %d of %d releases matched", found, len(rows))
+    log.info("enrich: %d of %d releases matched (%d web lookups)", found, len(rows), web)
+    return found
