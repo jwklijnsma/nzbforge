@@ -77,9 +77,11 @@ In the Podman env file, don't put quotes or comments after a value. After a chan
 ### Metadata (posters, descriptions, genres, ratings)
 | Option | Default | What it does |
 |---|---|---|
-| `TMDB_API_KEY` | – | TMDB API key (free at themoviedb.org) for **movies**. TV uses TVmaze and needs no key. |
+| `TMDB_API_KEY` | – | Optional. TMDB API key (free at themoviedb.org); when set, movies are looked up on TMDB first. Without it movies still get metadata from Cinemeta. |
+| `CINEMETA` | `1` | Free, keyless metadata from Cinemeta (Stremio's public IMDb-based catalogue): IMDb id, poster, plot, genres, IMDb rating. Used for **movies** (or after TMDB when a key is set) and for **shows TVmaze doesn't know**. `0` = off. |
+| `CINEMETA_URL` | `https://v3-cinemeta.strem.io` | Cinemeta address, e.g. for a self-hosted copy. |
 | `ENRICH_PER_PASS` | `1000` | Releases looked up per processing round. |
-| `ENRICH_WORKERS` | `4` | Parallel lookups. Each site's rate limit is respected anyway (TVmaze 2/s, TMDB 20/s). |
+| `ENRICH_WORKERS` | `8` | Parallel lookups. Each site's rate limit is respected anyway (TVmaze 2/s, TMDB 20/s, Cinemeta 5/s). |
 
 ### Send to downloader (NZBGet / SABnzbd)
 Shows a **Send** button in the spot list and spot view.
@@ -91,6 +93,7 @@ Shows a **Send** button in the spot list and spot view.
 | `DOWNLOADER_USER` / `DOWNLOADER_PASS` | – | NZBGet control username/password. |
 | `DOWNLOADER_APIKEY` | – | SABnzbd API key. |
 | `DOWNLOADER_CATEGORIES` | NZBGet: `Movies`, `Series`, `Music`, `Software`; SABnzbd: `movies`, `tv`, `audio`, `software` | Newznab category to downloader category, e.g. `2000=Movies,5000=Series,3000=Music`. A subcategory (`2045`) falls back to its parent (`2000`). |
+| `DOWNLOADER_PRIORITY` | `normal` | Priority of NZBs sent with **Send**: `low`, `normal`, `high`, `veryhigh` or `force` (starts at once, even when the queue is paused). |
 
 ### Web server
 These are uvicorn options, on the command line rather than in the env file (the container already uses them):
@@ -210,8 +213,9 @@ On a test server with 0.4 s latency per 10,000 headers: 18,000 headers/s before,
 
 ## Release information (Spotweb-style)
 - **Details panel**: click a release for poster, description, rating, file list with part counts, and the NFO.
-- **TV** metadata comes from TVmaze (no key needed). **Movies** use TMDB: set `TMDB_API_KEY` (free key).
-  Credit: this product uses the TMDB API but is not endorsed or certified by TMDB. TV data courtesy of TVmaze (CC BY-SA).
+- **TV** metadata comes from TVmaze, **movies** from Cinemeta; neither needs a key. Shows TVmaze doesn't know fall back
+  to Cinemeta. With `TMDB_API_KEY` set, movies are looked up on TMDB first.
+  Credit: this product uses the TMDB API but is not endorsed or certified by TMDB. TV data courtesy of TVmaze (CC BY-SA). Movie data via Cinemeta (Stremio).
 - **NFO files** are downloaded from Usenet (first segment of the `.nfo`) by the scanner.
 - The API also returns `tvdbid`, `imdb`, `tmdbid`, `coverurl`, `rating` and `year`, and accepts `tvdbid`/`imdbid`/`tmdbid`
   search params, so Sonarr and Radarr can match releases by id. Releases not looked up yet still match by title.
@@ -223,7 +227,7 @@ On a test server with 0.4 s latency per 10,000 headers: 18,000 headers/s before,
 - Obfuscated posts (random per-file names) are not grouped; needs set-marker/poster/time-window grouping.
 - Real Spotnet spots (`free.pt`) are not read yet.
 - Collections store parts in a JSON column. Fine for a personal index; for millions of headers a `parts` table + Postgres would scale better.
-- Categories come from name heuristics; TV/movie metadata comes from TVmaze/TMDB title matching (no TVDB API).
+- Categories come from name heuristics; TV/movie metadata comes from TVmaze/Cinemeta/TMDB title matching (no TVDB API).
 - No PAR2 inspection, passworded-release detection, or release de-duplication across groups.
 - Check your Usenet provider's terms before bulk-scanning headers.
 

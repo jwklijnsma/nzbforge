@@ -1,7 +1,8 @@
 """Send an NZB to NZBGet or SABnzbd (Spotweb's 'send to downloader').
 
 DOWNLOADER=nzbget|sabnzbd, DOWNLOADER_URL=http://host:port, DOWNLOADER_USER / DOWNLOADER_PASS (NZBGet),
-DOWNLOADER_APIKEY (SABnzbd), DOWNLOADER_CATEGORIES="2000=Movies,5000=Series,3000=Music" (Newznab parent -> category).
+DOWNLOADER_APIKEY (SABnzbd), DOWNLOADER_CATEGORIES="2000=Movies,5000=Series,3000=Music" (Newznab parent -> category),
+DOWNLOADER_PRIORITY=normal|high|force (force starts it right away, even when the queue is paused).
 """
 import base64
 import json
@@ -15,6 +16,11 @@ URL = os.getenv("DOWNLOADER_URL", "").rstrip("/")
 USER = os.getenv("DOWNLOADER_USER", "")
 PASS = os.getenv("DOWNLOADER_PASS", "")
 APIKEY = os.getenv("DOWNLOADER_APIKEY", "")
+PRIORITY = os.getenv("DOWNLOADER_PRIORITY", "normal").strip().lower()
+PRIORITIES = {  # NZBGet append() priority / SABnzbd priority
+    "nzbget": {"low": -50, "normal": 0, "high": 50, "veryhigh": 100, "force": 900},
+    "sabnzbd": {"low": -1, "normal": 0, "high": 1, "veryhigh": 1, "force": 2},
+}
 DEFAULT_CATS = {
     "nzbget": {1000: "Software", 2000: "Movies", 3000: "Music", 4000: "Software", 5000: "Series"},
     "sabnzbd": {1000: "software", 2000: "movies", 3000: "audio", 4000: "software", 5000: "tv"},
@@ -44,7 +50,7 @@ def send(nzb: str, title: str, cat: int):
     if KIND == "nzbget":
         body = json.dumps({"method": "append", "params": [
             f"{title}.nzb", base64.b64encode(nzb.encode()).decode(), category,
-            0, False, False, "", 0, "SCORE", []]}).encode()
+            PRIORITIES["nzbget"].get(PRIORITY, 0), False, False, "", 0, "SCORE", []]}).encode()
         req = urllib.request.Request(f"{URL}/jsonrpc", body, {"Content-Type": "application/json"})
         if USER:
             req.add_header("Authorization", "Basic " + base64.b64encode(f"{USER}:{PASS}".encode()).decode())
@@ -56,7 +62,8 @@ def send(nzb: str, title: str, cat: int):
     boundary = uuid.uuid4().hex
     body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"{title}.nzb\"\r\n"
             f"Content-Type: application/x-nzb\r\n\r\n{nzb}\r\n--{boundary}--\r\n").encode()
-    q = urllib.parse.urlencode({"mode": "addfile", "apikey": APIKEY, "output": "json", "nzbname": title, "cat": category})
+    q = urllib.parse.urlencode({"mode": "addfile", "apikey": APIKEY, "output": "json", "nzbname": title, "cat": category,
+                               "priority": PRIORITIES["sabnzbd"].get(PRIORITY, 0)})
     req = urllib.request.Request(f"{URL}/api?{q}", body, {"Content-Type": f"multipart/form-data; boundary={boundary}"})
     res = _open(req)
     if not res.get("status"):

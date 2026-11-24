@@ -405,7 +405,9 @@ def parse_date(s):
         return datetime.utcnow()
 
 
-def ingest(db, group, lines):
+def parse_overview(lines):
+    """XOVER lines -> [(info, poster, msgid, when, bytes, base)]. Runs on the NNTP worker threads,
+    so parsing the next batch overlaps with saving the previous one."""
     parsed = []
     for line in lines:
         f = line.split("\t")
@@ -414,12 +416,18 @@ def ingest(db, group, lines):
         info = parse_subject(f[1])
         if not info:
             continue
-        poster, msgid, when = f[2][:255], f[4], parse_date(f[3])
         try:
             nbytes = int(f[6])
         except ValueError:
             nbytes = 0
-        parsed.append((info, poster, msgid, when, nbytes, info["base"][:512]))
+        parsed.append((info, f[2][:255], f[4], parse_date(f[3]), nbytes, info["base"][:512]))
+    return parsed
+
+
+def ingest(db, group, parsed, commit=True):
+    """Store parsed headers (see parse_overview; raw XOVER lines are parsed here too)."""
+    if parsed and isinstance(parsed[0], str):
+        parsed = parse_overview(parsed)
     # one query for every collection this batch touches (instead of one per post)
     cache = {}
     bases = list({p[5] for p in parsed})
@@ -443,7 +451,8 @@ def ingest(db, group, lines):
         col.posted = min(col.posted, when)
     for col in touched.values():
         flag_modified(col, "data")
-    db.commit()
+    if commit:
+        db.commit()
 
 
 def make_release(db, col, group_name):
@@ -485,7 +494,11 @@ def finalize(db):
     now = datetime.utcnow()
     names = {}
     made = dropped = 0
-    for col in db.scalars(select(Collection).order_by(Collection.updated).limit(20000)).all():
+    # Every outcome below needs >= 10 minutes without new parts: skip the (often huge) collections still
+    # being posted instead of loading their part lists on every processing round.
+    idle_since = now - timedelta(minutes=10)
+    q = select(Collection).where(Collection.updated < idle_since).order_by(Collection.updated).limit(20000)
+    for col in db.scalars(q).all():
         have = sum(len(f["parts"]) for f in col.data.values())
         want = sum(f["total"] for f in col.data.values())
         comp = have / want if want else 0
@@ -506,8 +519,13 @@ def finalize(db):
     return made
 
 
+_YENC = bytes((b - 42) & 255 for b in range(256))
+_YENC_ESC = bytes((b - 106) & 255 for b in range(256))  # byte after "=": minus 64, then minus 42
+
+
 def yenc_decode(lines):
-    out, in_data = bytearray(), False
+    """yEnc body lines -> bytes, using bytes.translate (C speed) instead of a per-byte Python loop."""
+    out, in_data = [], False
     for line in lines:
         if line.startswith(b"=ybegin"):
             in_data = True
@@ -518,16 +536,15 @@ def yenc_decode(lines):
             break
         if not in_data:
             continue
-        esc = False
-        for b in line:
-            if esc:
-                out.append((b - 64 - 42) & 255)
-                esc = False
-            elif b == 61:  # "="
-                esc = True
-            else:
-                out.append((b - 42) & 255)
-    return bytes(out)
+        if b"=" not in line:
+            out.append(line.translate(_YENC))
+            continue
+        chunks = line.split(b"=")
+        out.append(chunks[0].translate(_YENC))
+        for c in chunks[1:]:
+            if c:
+                out.append(c[:1].translate(_YENC_ESC) + c[1:].translate(_YENC))
+    return b"".join(out)
 
 
 def fetch_nfos(pool, db, limit=NFO_PER_PASS):
@@ -581,6 +598,11 @@ def import_groups(db, nntp, pattern="alt.binaries.*", min_articles=1):
     return added, matched
 
 
+def _xover_parsed(conn, a, b):
+    lines = conn.xover(a, b)
+    return len(lines), parse_overview(lines)
+
+
 def scan_group(pool, db, g):
     first, last = pool.group(g.name)
     g.server_first, g.server_last, g.last_error = first, last, None
@@ -599,17 +621,17 @@ def scan_group(pool, db, g):
         while ranges or inflight:
             while ranges and len(inflight) < pool.size * 2:  # keep every connection busy
                 x, y = ranges.popleft()
-                inflight.append((y, pool.xover(g.name, x, y)))
+                inflight.append((y, pool.submit(lambda c, x=x, y=y: _xover_parsed(c, x, y), g.name)))
             y, fut = inflight.popleft()
-            lines = fut.result()
-            ingest(db, g, lines)
-            headers += len(lines)
+            count, parsed = fut.result()
+            ingest(db, g, parsed, commit=False)
+            headers += count
             g.last_article = y
-            db.commit()
+            db.commit()  # headers and the new position in one transaction
             rate = headers / max(0.001, time.monotonic() - t0)
             with _lock:
                 STATUS["scanner"]["article"] = y
-                STATUS["scanner"]["headers"] += len(lines)
+                STATUS["scanner"]["headers"] += count
                 STATUS["scanner"]["rate"] = round(rate)
             log.info("%s: %d/%d (%.0f headers/s)", g.name, y, last, rate)
     finally:
