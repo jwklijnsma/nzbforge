@@ -1,4 +1,8 @@
-"""Metadata enrichment: TV via TVmaze (no key), movies via TMDB (set TMDB_API_KEY)."""
+"""Metadata enrichment, all free:
+
+TV via TVmaze (no key), movies via Cinemeta (no key; Stremio's public IMDb-based catalogue) or TMDB when
+TMDB_API_KEY is set. Cinemeta also fills in shows TVmaze doesn't know, and movies TMDB doesn't find.
+"""
 import html
 import json
 import logging
@@ -19,7 +23,9 @@ from .models import Release
 log = logging.getLogger("enrich")
 TMDB_KEY = os.getenv("TMDB_API_KEY", "")
 PER_PASS = int(os.getenv("ENRICH_PER_PASS", "1000"))
-WORKERS = int(os.getenv("ENRICH_WORKERS", "4"))
+WORKERS = int(os.getenv("ENRICH_WORKERS", "8"))
+CINEMETA = os.getenv("CINEMETA", "1") == "1"
+CINEMETA_URL = os.getenv("CINEMETA_URL", "https://v3-cinemeta.strem.io").rstrip("/")
 CACHE_HOURS = 12
 FIELDS = ("meta_title", "year", "overview", "poster_url", "rating", "imdbid", "tvdbid", "tmdbid", "genres", "website")
 
@@ -38,7 +44,8 @@ class _Rate:
         time.sleep(max(0.0, at - now))
 
 
-RATES = {"api.tvmaze.com": _Rate(2), "api.themoviedb.org": _Rate(20)}  # TVmaze: 20 calls / 10 s
+RATES = {"api.tvmaze.com": _Rate(2), "api.themoviedb.org": _Rate(20),  # TVmaze: 20 calls / 10 s
+         urllib.parse.urlsplit(CINEMETA_URL).hostname: _Rate(5)}
 _cache: dict = {}  # (kind, title, year) -> (time, info or None), kept between passes
 _cache_lock = threading.Lock()
 
@@ -116,9 +123,70 @@ def tmdb_movie(title, year=None):
     }
 
 
+def _norm(s):
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
+def cinemeta(kind, title, year=None):
+    """Free, keyless lookup: search the catalogue, pick the best title/year match, then fetch its details."""
+    ctype = "series" if kind == "tv" else "movie"
+    q = urllib.parse.quote(title, safe="")
+    metas = _get(f"{CINEMETA_URL}/catalog/{ctype}/top/search={q}.json").get("metas") or []
+    if not metas:
+        return None
+
+    def score(m):
+        y = (m.get("releaseInfo") or "")[:4]
+        y = int(y) if y.isdigit() else None
+        same_name = _norm(m.get("name")) == _norm(title)
+        year_ok = not year or (y is not None and abs(y - year) <= 1)
+        return (same_name and year_ok, year_ok, same_name)
+
+    best = max(metas[:10], key=score)  # max() keeps the first (most relevant) one on ties
+    if kind == "movie" and year and not score(best)[1]:
+        return None  # wrong film is worse than no film
+    d = _get(f"{CINEMETA_URL}/meta/{ctype}/{best['id']}.json").get("meta") or {}
+    imdb = d.get("imdb_id") or best.get("imdb_id") or best["id"]
+    y = (d.get("year") or d.get("releaseInfo") or best.get("releaseInfo") or "")[:4]
+    try:
+        rating = round(float(d.get("imdbRating")), 1)
+    except (TypeError, ValueError):
+        rating = None
+    info = {
+        "meta_title": d.get("name") or best.get("name"),
+        "year": int(y) if y.isdigit() else None,
+        "overview": _clean(d.get("description")),
+        "poster_url": d.get("poster") or best.get("poster"),
+        "rating": rating,
+        "imdbid": imdb if str(imdb).startswith("tt") else None,
+        "genres": ", ".join(d.get("genres") or d.get("genre") or []),
+        "website": f"https://www.imdb.com/title/{imdb}/" if str(imdb).startswith("tt") else None,
+    }
+    if d.get("moviedb_id"):
+        info["tmdbid"] = int(d["moviedb_id"])
+    if d.get("tvdb_id"):
+        info["tvdbid"] = int(d["tvdb_id"])
+    return info
+
+
 def _lookup(key):
+    """First source that knows the title wins; a failure of one source falls through to the next."""
     kind, title, year = key
-    return tvmaze(title, year) if kind == "tv" else tmdb_movie(title, year)
+    sources = [tvmaze] if kind == "tv" else ([tmdb_movie] if TMDB_KEY else [])
+    if CINEMETA:
+        sources.append(lambda t, y: cinemeta(kind, t, y))
+    error = None
+    for src in sources:
+        try:
+            info = src(title, year)
+        except Exception as e:  # e.g. one site down: try the next, retry next pass if all fail
+            error = e
+            continue
+        if info:
+            return info
+    if error:
+        raise error
+    return None
 
 
 def _known(db, kind, title, year):
@@ -139,7 +207,7 @@ def enrich_pending(db, limit=PER_PASS):
     same title already has, and only then TVmaze/TMDB, in parallel within each site's rate limit.
     """
     cats = [Release.category.between(5000, 5999)]
-    if TMDB_KEY:
+    if TMDB_KEY or CINEMETA:
         cats.append(Release.category.between(2000, 2999))
     rows = db.scalars(
         select(Release)
