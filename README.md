@@ -59,9 +59,11 @@ In the Podman env file, don't put quotes or comments after a value. After a chan
 | `NNTP_SSL` | `1` | `1` = SSL/TLS, `0` = plain text. |
 | `NNTP_USER` / `NNTP_PASS` | – | Your provider login. |
 | `NNTP_CONNECTIONS` | `8` | Parallel connections for headers and NFOs. Keep the total of nzbforge **plus your downloader** under your provider's connection limit. |
-| `NNTP_TIMEOUT` | `60` | Seconds a connection may stay silent before the request is retried on a fresh connection. |
+| `NNTP_TIMEOUT` | `60` | Seconds a connection may stay silent before the request is retried on a fresh connection. A header range that times out twice is fetched again in smaller pieces. |
+| `NNTP_RETRIES` | `4` | Tries per request before a group is skipped for this pull. From the third try on, a brand-new connection is used. |
+| `NNTP_IDLE_CHECK` | `20` | A connection that sat idle this many seconds is checked (`DATE`) before reuse; providers close idle connections, and reusing a dead one gave `EOFError: connection closed`. |
 | `NNTP_CONNECT_TIMEOUT` | `30` | Seconds to connect and get the server's greeting. A refused connection (e.g. *502 too many connections*) makes nzbforge continue with the connections it already has. |
-| `NNTP_COMPRESS` | `1` | Ask for compressed headers (`XFEATURE COMPRESS GZIP`). Providers without it are detected automatically, and if compressed replies can't be decoded it is switched off for the rest of the pull. Set `0` to switch it off. |
+| `NNTP_COMPRESS` | `1` | Ask for compressed headers (`XFEATURE COMPRESS GZIP`). Providers without it are detected automatically, and if compressed replies can't be decoded it is switched off for the rest of the pull (a dropped connection or timeout doesn't count). Set `0` to switch it off. |
 
 ### Scanning
 | Option | Default | What it does |
@@ -69,7 +71,8 @@ In the Podman env file, don't put quotes or comments after a value. After a chan
 | `SCAN_INTERVAL` | `300` | Seconds between automatic pulls. "Pull now" in the Admin tab doesn't wait for this. |
 | `INITIAL_ARTICLES` | `200000` | How far back to start in a group that has never been pulled (number of headers). Lower it (e.g. `20000`) when you import many groups. |
 | `SCAN_BATCH` | `10000` | Headers per XOVER request. |
-| `POSTPROCESS_EVERY` | `300` | During long pulls, build releases and fetch metadata/NFOs every N seconds between groups, so new spots appear before the pull is done. |
+| `POSTPROCESS_EVERY` | `300` | During long pulls, build releases and fetch NFOs every N seconds, so new spots appear before the pull is done. |
+| `ENRICH_EVERY` | `60` | During a pull, metadata (TVmaze/TMDB/Cinemeta) is looked up on its own thread every N seconds, so the rate-limited lookups never pause the header download. |
 | `MIN_COMPLETION` | `0.90` | A post becomes a release when it is complete, or at least this complete (0-1) and has had no new parts for 2 hours. |
 | `EXPIRE_DAYS` | `3` | Unfinished posts older than this are dropped. |
 | `NFO_PER_PASS` | `100` | NFO files downloaded per processing round. |
@@ -174,17 +177,26 @@ plus `python -m app.scanner`.
 
 ## Speed
 - **Parallel connections** (`NNTP_CONNECTIONS`, default 8): header batches are fetched on several connections at once
-  and ahead of time, while the previous batch is being saved. Keep it below your provider's connection limit
+  and ahead of time, while the previous batch is being saved. This runs across groups: the next groups' `GROUP` and
+  `XOVER` requests are already on the wire while the current one is saved, so thousands of small groups don't each
+  wait for their own round trips. Keep it below your provider's connection limit
   (and leave room for your downloader).
 - **Compressed headers** (`NNTP_COMPRESS=1`): providers that support `XFEATURE COMPRESS GZIP` (Highwinds/Giganews
   based ones, among others) send headers zlib-compressed, usually 5-10x less data. Others are detected and read as plain text.
 - **SQLite in WAL mode**: the scanner writes while the web UI keeps reading, and commits are much cheaper.
-- **Releases and metadata during long pulls**: every `POSTPROCESS_EVERY` seconds (default 300) between groups, so
-  new spots show up without waiting for the last group. NFOs are fetched in parallel.
+- **Releases during long pulls**: every `POSTPROCESS_EVERY` seconds (default 300), so new spots show up without
+  waiting for the last group. NFOs are fetched in parallel. Metadata lookups run on a separate thread and never
+  stop the pull (before, a pull stood still for minutes while TVmaze's 2 requests/s limit was waited out, and the
+  provider dropped the idle connections in the meantime).
+- **Bulk inserts**: new collections (nearly every post in obfuscated groups) are written with one bulk `INSERT` per batch.
+- **Self-healing connections**: idle connections are checked before reuse and dead ones replaced; slow header ranges
+  are split instead of failing the group.
 - **Metadata**: titles that already have metadata (earlier episodes) are copied without a web lookup, lookups are cached
   for 12 hours, and run in parallel (`ENRICH_WORKERS`) within TVmaze's and TMDB's rate limits.
 
 On a test server with 0.4 s latency per 10,000 headers: 18,000 headers/s before, 56,000 headers/s with 8 connections.
+Simulated pull of 300 mixed-size groups (40 ms round trip, 16 connections): 11,700 headers/s before the cross-group
+pipeline, 38,000 headers/s after. Past that the limit is CPU (parsing + saving run in one Python process), not your line.
 
 ## Pulling groups (Admin tab)
 ![Pull progress](docs/img/pulling.png)

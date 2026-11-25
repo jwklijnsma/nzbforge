@@ -70,26 +70,41 @@ def test_import_endpoint(client, monkeypatch):
     assert (job["state"], job["matched"], job["added"]) == ("done", 1, 1), job["error"]
 
 
-def test_bad_group_does_not_stop_pass(monkeypatch):
-    scanned = []
-
-    def scan_group(nntp, db, g):
-        scanned.append(g.name)
-        if len(scanned) == 1:
-            raise RuntimeError("GROUP x: 411 no such group")
-        return 5
+def test_bad_group_does_not_stop_pass(client, monkeypatch):
+    from app.db import SessionLocal
+    from app.models import Group
 
     class N:
+        compressed = False
+
+        def __init__(self, *a, **k):
+            pass
+
+        def group(self, name):
+            if name == "alt.binaries.aaa.bad":
+                raise RuntimeError("GROUP x: 411 no such group")
+            return 1, 5
+
+        def xover(self, a, b):
+            return [f'{n}\t"Bad.Test.S01E01.part{n}.rar" yEnc (1/1)\tp@x\tMon, 23 Nov 2026 20:00:00 +0000\t'
+                    f'<{n}@x>\t\t1000\t10' for n in range(a, b + 1)]
+
         def close(self):
             pass
 
-    monkeypatch.setattr(scanner, "NNTP", lambda *a, **k: N())
-    monkeypatch.setattr(scanner, "scan_group", scan_group)
+    with SessionLocal() as db:
+        db.add_all([Group(name="alt.binaries.aaa.bad"), Group(name="alt.binaries.aaa.good")])
+        db.commit()
+    monkeypatch.setattr(scanner, "NNTP", N)
     for f in ("finalize", "enrich_pending"):
         monkeypatch.setattr(scanner, f, lambda db: None)
     monkeypatch.setattr(scanner, "fetch_nfos", lambda nntp, db: None)
-    scanner.scan_pass()
-    assert len(scanned) >= 2
+    scanner.scan_pass({"alt.binaries.aaa.bad", "alt.binaries.aaa.good"})
     last = scanner.status()["scanner"]["last_pass"]
-    assert last["errors"] and "411" in last["errors"][0] and last["headers"] == 5 * (len(scanned) - 1)
+    assert last["errors"] and "411" in last["errors"][0]
+    assert last["groups"] == 1 and last["headers"] == 5
     assert scanner.status()["scanner"]["state"] == "idle"
+    with SessionLocal() as db:  # don't leave collections behind for other tests' finalize()
+        from app.models import Collection
+        db.query(Collection).delete()
+        db.commit()

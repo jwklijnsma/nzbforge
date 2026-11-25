@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
-from sqlalchemy import select
+from sqlalchemy import insert, select
 from sqlalchemy.orm.attributes import flag_modified
 
 from .db import SessionLocal, init_db
@@ -44,6 +44,9 @@ COMPRESS = os.getenv("NNTP_COMPRESS", "1") == "1"                    # XFEATURE 
 POSTPROCESS_EVERY = int(os.getenv("POSTPROCESS_EVERY", "300"))       # build releases/metadata during long pulls
 CONNECT_TIMEOUT = int(os.getenv("NNTP_CONNECT_TIMEOUT", "30"))       # seconds for connect + greeting
 READ_TIMEOUT = int(os.getenv("NNTP_TIMEOUT", "60"))                  # seconds without data before a read fails
+IDLE_CHECK = int(os.getenv("NNTP_IDLE_CHECK", "20"))                 # ping a connection idle this long before reuse
+RETRIES = max(1, int(os.getenv("NNTP_RETRIES", "4")))                # tries per request, each on a working connection
+ENRICH_EVERY = int(os.getenv("ENRICH_EVERY", "60"))                  # seconds between metadata rounds during a pull
 
 
 # ---------- live job status (read by GET /web/jobs) ----------
@@ -287,6 +290,16 @@ class NNTP:
         code, _ = self.cmd(f"BODY <{msgid.strip('<>')}>")
         return self._multiline_bytes() if code == 222 else None
 
+    def ping(self, timeout=10):
+        """Cheap round trip (DATE) to check an idle connection wasn't dropped by the provider."""
+        self.sock.settimeout(timeout)
+        try:
+            if self.r.buffered():
+                raise EOFError("stray data on idle connection")
+            self.cmd("DATE")  # any status line (111, or 500 on servers without DATE) proves it is alive
+        finally:
+            self.sock.settimeout(READ_TIMEOUT)
+
 
 class Pool:
     """Up to NNTP_CONNECTIONS connections shared by worker threads for one pass.
@@ -307,12 +320,16 @@ class Pool:
         self._lock = threading.Lock()
         self.executor = ThreadPoolExecutor(self.size, thread_name_prefix="nntp")
 
-    def _acquire(self):
+    def _acquire(self, fresh=False):
         while True:
             try:
-                return self._idle.get_nowait()
+                c = self._idle.get_nowait()
             except queue.Empty:
-                pass
+                c = None
+            if c is not None and not self._usable(c, fresh):
+                continue
+            if c is not None:
+                return c
             with self._lock:
                 opening = self._open < self.limit
                 if opening:
@@ -331,14 +348,40 @@ class Pool:
                     log.warning("could not open another connection (%s); continuing with %d", e, others)
                     continue
                 c.current_group = None
+                c.last_used = time.monotonic()
                 with self._lock:
                     self._all.append(c)
                     self.compressed = self.compressed or getattr(c, "compressed", False)
                 return c
             try:
-                return self._idle.get(timeout=1)
+                c = self._idle.get(timeout=1)
             except queue.Empty:
                 continue
+            if self._usable(c, fresh):
+                return c
+
+    def _usable(self, c, fresh=False):
+        """False (and the connection is closed) when it was dropped while idle, or a fresh one is wanted.
+
+        Providers close connections that sit idle (e.g. while releases are being built); reusing such a
+        connection is what produced the 'EOFError: connection closed' runs of failed groups.
+        """
+        if fresh:
+            self._discard(c)
+            return False
+        if time.monotonic() - getattr(c, "last_used", 0) < IDLE_CHECK or not hasattr(c, "ping"):
+            return True
+        try:
+            c.ping()
+            return True
+        except Exception as e:
+            log.info("idle connection was closed by the server (%s); reconnecting", e)
+            self._discard(c)
+            return False
+
+    def _release(self, c):
+        c.last_used = time.monotonic()
+        self._idle.put(c)
 
     def _discard(self, c):
         with self._lock:
@@ -348,26 +391,31 @@ class Pool:
         c.close()
 
     def _call(self, fn, group=None):
-        for attempt in (1, 2):
-            c = self._acquire()
+        for attempt in range(1, RETRIES + 1):
+            c = self._acquire(fresh=attempt > 2)  # after two failures don't trust any pooled connection
             try:
                 if group and c.current_group != group:
+                    c.current_group = None
                     c.group(group)
                     c.current_group = group
                 out = fn(c)
             except RuntimeError:
-                self._idle.put(c)  # NNTP error reply (e.g. 411 no such group): connection is fine
+                self._release(c)  # NNTP error reply (e.g. 411 no such group): connection is fine
                 raise
             except (OSError, EOFError, ValueError, zlib.error) as e:
                 self._discard(c)
-                decode_error = isinstance(e, (EOFError, ValueError, zlib.error))  # not plain timeouts/resets
-                if decode_error and getattr(c, "compressed", False) and self.compress:
+                # Only a reply that can't be decoded says compression is the problem; a dropped connection
+                # or timeout is not a reason to fetch every following header uncompressed.
+                bad_stream = isinstance(e, (ValueError, zlib.error)) or str(e).startswith("unexpected reply")
+                if bad_stream and getattr(c, "compressed", False) and self.compress:
                     self.compress = False
                     log.warning("compressed headers failed (%s); switching compression off", e)
-                if attempt == 2:
-                    raise
+                if attempt == RETRIES or (isinstance(e, TimeoutError) and attempt >= 2):
+                    raise  # a range that times out twice is fetched in smaller pieces instead (see _fetch)
+                log.info("retrying after %s: %s (attempt %d/%d)", type(e).__name__, e, attempt + 1, RETRIES)
+                time.sleep(min(0.5 * attempt, 3))
                 continue
-            self._idle.put(c)
+            self._release(c)
             return out
 
     def submit(self, fn, group=None):
@@ -378,7 +426,16 @@ class Pool:
         self.submit(lambda c: None).result()
 
     def group(self, name):
-        return self.submit(lambda c: c.group(name)).result()
+        return self.group_info(name).result()
+
+    def group_info(self, name):
+        """Future for (first, last) of a group; the connection stays in that group for the XOVERs."""
+        def run(c):
+            c.current_group = None
+            out = c.group(name)
+            c.current_group = name
+            return out
+        return self.submit(run)
 
     def xover(self, group, a, b):
         return self.submit(lambda c: c.xover(a, b), group)
@@ -425,7 +482,11 @@ def parse_overview(lines):
 
 
 def ingest(db, group, parsed, commit=True):
-    """Store parsed headers (see parse_overview; raw XOVER lines are parsed here too)."""
+    """Store parsed headers (see parse_overview; raw XOVER lines are parsed here too).
+
+    Existing collections are updated through the ORM; new ones (most of them in obfuscated groups,
+    where nearly every post is its own collection) go in with one bulk INSERT.
+    """
     if parsed and isinstance(parsed[0], str):
         parsed = parse_overview(parsed)
     # one query for every collection this batch touches (instead of one per post)
@@ -435,22 +496,34 @@ def ingest(db, group, parsed, commit=True):
         for col in db.scalars(select(Collection).where(Collection.group_id == group.id,
                                                        Collection.base.in_(bases[i:i + 500]))):
             cache[(col.poster, col.base)] = col
-    touched = {}
+    touched, new = {}, {}
     for info, poster, msgid, when, nbytes, base in parsed:
-        col = cache.get((poster, base))
-        if col is None:
-            col = Collection(group_id=group.id, poster=poster, base=base,
-                             set_total=info["set_total"], posted=when, updated=when, data={})
-            db.add(col)
-            cache[(poster, base)] = col
-        touched[id(col)] = col
-        entry = col.data.setdefault(info["file"], {"total": info["parts_total"], "parts": {}})
+        key = (poster, base)
+        col = cache.get(key)
+        if col is not None:
+            touched[id(col)] = col
+            entry = col.data.setdefault(info["file"], {"total": info["parts_total"], "parts": {}})
+            entry["parts"][str(info["part"])] = [msgid, nbytes]
+            col.set_total = col.set_total or info["set_total"]
+            col.updated = max(col.updated, when)
+            col.posted = min(col.posted, when)
+            continue
+        row = new.get(key)
+        if row is None:
+            row = new[key] = {"group_id": group.id, "poster": poster, "base": base, "set_total": info["set_total"],
+                              "posted": when, "updated": when, "data": {}}
+        entry = row["data"].setdefault(info["file"], {"total": info["parts_total"], "parts": {}})
         entry["parts"][str(info["part"])] = [msgid, nbytes]
-        col.set_total = col.set_total or info["set_total"]
-        col.updated = max(col.updated, when)
-        col.posted = min(col.posted, when)
+        row["set_total"] = row["set_total"] or info["set_total"]
+        row["updated"] = max(row["updated"], when)
+        row["posted"] = min(row["posted"], when)
     for col in touched.values():
         flag_modified(col, "data")
+    if new:
+        db.flush()
+        rows = list(new.values())
+        for i in range(0, len(rows), 2000):
+            db.execute(insert(Collection), rows[i:i + 2000])
     if commit:
         db.commit()
 
@@ -603,61 +676,202 @@ def _xover_parsed(conn, a, b):
     return len(lines), parse_overview(lines)
 
 
-def scan_group(pool, db, g):
-    first, last = pool.group(g.name)
-    g.server_first, g.server_last, g.last_error = first, last, None
-    if last < first or last == 0:
-        g.scanned_at = datetime.utcnow()
-        db.commit()
-        return 0  # empty group
-    if g.last_article > last:  # provider reset numbering
-        g.last_article = 0
-    a = g.last_article + 1 if g.last_article else max(first, last - INITIAL)
-    _set("scanner", article_from=a, article_to=last, article=a - 1)
-    ranges = deque((x, min(x + BATCH - 1, last)) for x in range(a, last + 1, BATCH))
-    inflight = deque()  # in order, so last_article only ever moves forward over saved batches
-    headers, t0 = 0, time.monotonic()
+def _fetch(pool, name, x, y, min_size=None):
+    """XOVER x-y; when it keeps failing (e.g. the provider times out on a big range of old articles)
+    fetch it again as two halves, down to min_size, before giving up."""
+    min_size = min_size or max(100, BATCH // 16)
     try:
-        while ranges or inflight:
-            while ranges and len(inflight) < pool.size * 2:  # keep every connection busy
-                x, y = ranges.popleft()
-                inflight.append((y, pool.submit(lambda c, x=x, y=y: _xover_parsed(c, x, y), g.name)))
-            y, fut = inflight.popleft()
-            count, parsed = fut.result()
-            ingest(db, g, parsed, commit=False)
-            headers += count
-            g.last_article = y
+        return pool.submit(lambda c: _xover_parsed(c, x, y), name).result()
+    except (OSError, EOFError) as e:
+        if y - x + 1 <= min_size:
+            raise
+        mid = (x + y) // 2
+        log.info("%s: %d-%d failed (%s); fetching it in two halves", name, x, y, e)
+        halves = [pool.submit(lambda c, a=a, b=b: _xover_parsed(c, a, b), name) for a, b in ((x, mid), (mid + 1, y))]
+        count, parsed = 0, []
+        for (a, b), fut in zip(((x, mid), (mid + 1, y)), halves):
+            try:
+                n, p = fut.result()
+            except (OSError, EOFError):
+                n, p = _fetch(pool, name, a, b, min_size)
+            count += n
+            parsed += p
+        return count, parsed
+
+
+class _Job:
+    """One group in the pipeline."""
+
+    def __init__(self, g, info):
+        self.g, self.info = g, info          # info: future of the GROUP reply
+        self.ranges = None                   # deque of (x, y) still to submit; None until GROUP answered
+        self.a = self.last = 0
+        self.headers = 0
+        self.error = None
+
+
+def scan_groups(pool, db, groups, done=None, tick=None):
+    """Pull new headers for `groups`, keeping every connection busy across group boundaries.
+
+    GROUP commands for the next groups and XOVER batches of the next group are already running while
+    the current group's batches are saved, so the thousands of small groups don't each wait for a round
+    trip. Batches are saved in order, so a group's last_article only moves forward over saved headers.
+    done(index, group, headers, error) is called once per group, in order; tick() after each save.
+    """
+    groups = list(groups)
+    jobs: list[_Job] = []
+    inflight = deque()          # (job index, last article of batch, future), in submission order
+    cap = max(2, pool.size * 2)
+    lookahead = max(4, pool.size)
+    sub = con = 0               # next job to cut into batches / next job to report as done
+    t0 = time.monotonic()
+    total = 0
+
+    def open_jobs():
+        while len(jobs) < len(groups) and len(jobs) < sub + lookahead:
+            g = groups[len(jobs)]
+            jobs.append(_Job(g, pool.group_info(g.name)))
+
+    def plan(job):
+        g = job.g
+        try:
+            first, last = job.info.result()
+        except (RuntimeError, OSError, EOFError) as e:
+            job.error, job.ranges = e, deque()
+            return
+        g.server_first, g.server_last, g.last_error = first, last, None
+        if last < first or last == 0:
+            job.ranges = deque()  # empty group
+            return
+        if g.last_article > last:  # provider reset numbering
+            g.last_article = 0
+        job.a = g.last_article + 1 if g.last_article else max(first, last - INITIAL)
+        job.last = last
+        job.ranges = deque((x, min(x + BATCH - 1, last)) for x in range(job.a, last + 1, BATCH))
+
+    def show(i):
+        job = jobs[i]
+        _set("scanner", state="scanning", group=job.g.name, group_index=i + 1, group_count=len(groups),
+             article_from=job.a, article_to=job.last, article=max(job.a - 1, job.g.last_article or 0))
+
+    def finish(i):
+        job = jobs[i]
+        if job.error is None:
+            job.g.scanned_at = datetime.utcnow()
+        db.commit()
+        if done:
+            done(i, job.g, job.headers, job.error)
+
+    try:
+        while True:
+            open_jobs()
+            # fill the pipeline
+            while len(inflight) < cap and sub < len(groups):
+                job = jobs[sub]
+                if job.ranges is None:
+                    plan(job)
+                if job.ranges and job.error is None:
+                    x, y = job.ranges.popleft()
+                    name = job.g.name
+                    inflight.append((sub, x, y, pool.submit(lambda c, x=x, y=y: _xover_parsed(c, x, y), name)))
+                else:
+                    sub += 1
+                    open_jobs()
+            if not inflight:
+                while con < sub:
+                    show(con)
+                    finish(con)
+                    con += 1
+                if sub >= len(groups):
+                    break
+                continue
+            i, x, y, fut = inflight.popleft()
+            while con < i:  # every batch of the groups before this one is saved
+                finish(con)
+                con += 1
+            job = jobs[i]
+            if job.error is not None:
+                fut.cancel()
+                continue
+            show(i)
+            try:
+                try:
+                    count, parsed = fut.result()
+                except (OSError, EOFError):
+                    count, parsed = _fetch(pool, job.g.name, x, y)  # retry, splitting the range if needed
+            except (RuntimeError, OSError, EOFError) as e:
+                job.error = e
+                job.ranges.clear()
+                continue  # its later batches are dropped; the next pass starts again at last_article + 1
+            ingest(db, job.g, parsed, commit=False)
+            job.headers += count
+            total += count
+            job.g.last_article = y
             db.commit()  # headers and the new position in one transaction
-            rate = headers / max(0.001, time.monotonic() - t0)
+            rate = total / max(0.001, time.monotonic() - t0)
             with _lock:
                 STATUS["scanner"]["article"] = y
                 STATUS["scanner"]["headers"] += count
                 STATUS["scanner"]["rate"] = round(rate)
-            log.info("%s: %d/%d (%.0f headers/s)", g.name, y, last, rate)
+            log.info("%s: %d/%d (%.0f headers/s)", job.g.name, y, job.last, rate)
+            if tick:
+                tick()
     finally:
-        for _, fut in inflight:
+        for *_, fut in inflight:
             fut.cancel()
-    g.scanned_at = datetime.utcnow()
-    db.commit()
-    return headers
+        for job in jobs[sub:]:
+            job.info.cancel()
+    return total
+
+
+def scan_group(pool, db, g):
+    """Pull one group; raises its error (see scan_groups for many groups at once)."""
+    out = {}
+    scan_groups(pool, db, [g], done=lambda i, g, n, err: out.update(n=n, err=err))
+    if out.get("err") is not None:
+        raise out["err"]
+    return out.get("n", 0)
 
 
 def _postprocess(pool, db, summary):
-    """Turn finished collections into releases and look up metadata/NFOs."""
+    """Turn finished collections into releases and fetch NFOs (metadata runs on its own thread)."""
     _set("scanner", state="building releases", group=None)
     summary["releases"] += finalize(db) or 0
     tag_pending(db)
-    _set("scanner", state="looking up metadata")
-    enrich_pending(db)
     _set("scanner", state="fetching NFOs")
     fetch_nfos(pool, db)
+    _enrich_now.set()
+
+
+_enrich_now = threading.Event()
+
+
+class _Enricher(threading.Thread):
+    """TVmaze/TMDB/Cinemeta lookups are rate limited (TVmaze: 2/s, so 1000 titles take minutes).
+    They run here, next to the pull, instead of stopping the header download while they wait."""
+
+    def __init__(self):
+        super().__init__(name="enricher", daemon=True)
+        self.stop = threading.Event()
+
+    def run(self):
+        while not self.stop.is_set():
+            _enrich_now.wait(ENRICH_EVERY)
+            _enrich_now.clear()
+            if self.stop.is_set():
+                break
+            try:
+                with SessionLocal() as db:
+                    enrich_pending(db)
+            except Exception:
+                log.exception("metadata lookup failed")
 
 
 def scan_pass(only=None):
     """One pass over all active groups (or just the names in `only`), then build/enrich releases.
 
-    During long passes releases and metadata are also processed every POSTPROCESS_EVERY seconds,
-    so new spots show up without waiting for the last group.
+    During long passes releases are also built every POSTPROCESS_EVERY seconds, so new spots show up
+    without waiting for the last group; metadata is looked up meanwhile on a separate thread.
     """
     if not _pass_lock.acquire(blocking=False):
         return False  # a pass is already running; its caller will see the queued request
@@ -666,44 +880,59 @@ def scan_pass(only=None):
     _set("scanner", state="connecting", started=_iso(t0), headers=0, group=None, group_index=0, group_count=0,
          article=0, article_from=0, article_to=0, next_run=None, rate=0, connections=CONNECTIONS)
     pool = Pool()
+    enricher = _Enricher()
     try:
         pool.connect()
         _set("scanner", compressed=pool.compressed)
+        enricher.start()
         with SessionLocal() as db:
             q = select(Group).order_by(Group.name)
             q = q.where(Group.name.in_(only)) if only else q.where(Group.active)
             groups = db.scalars(q).all()
-            last_post = time.monotonic()
-            net_fails = 0
-            for i, g in enumerate(groups, 1):
-                _set("scanner", state="scanning", group=g.name, group_index=i, group_count=len(groups),
-                     article=0, article_from=0, article_to=0)
-                try:
-                    summary["headers"] += scan_group(pool, db, g) or 0
+            state = {"last_post": time.monotonic(), "net_fails": 0, "busy": False}
+
+            def done(i, g, headers, err):
+                if err is None:
+                    summary["headers"] += headers
                     summary["groups"] += 1
-                    net_fails = 0
-                except (RuntimeError, OSError, EOFError) as e:  # this group only; keep going
-                    db.rollback()
-                    msg = f"{type(e).__name__}: {e}" if isinstance(e, (OSError, EOFError)) else str(e)
+                    state["net_fails"] = 0
+                else:  # this group only; keep going
+                    msg = f"{type(err).__name__}: {err}" if isinstance(err, (OSError, EOFError)) else str(err)
                     g.last_error = msg[:255]
                     db.commit()
                     summary["errors"].append(f"{g.name}: {msg}")
                     log.warning("%s: skipped (%s)", g.name, msg)
-                    if not isinstance(e, RuntimeError):
-                        net_fails += 1
-                        if net_fails >= 3:  # the server itself is unreachable: stop this pass
-                            raise
+                    if not isinstance(err, RuntimeError):
+                        state["net_fails"] += 1
+                        if state["net_fails"] >= 3:  # every retry on fresh connections failed: server is down
+                            raise err
                 _set("scanner", connections=pool.connections(), compressed=pool.compressed and pool.compress)
                 with _lock:
                     _requested.discard(g.name)
-                if i < len(groups) and time.monotonic() - last_post > POSTPROCESS_EVERY:
-                    _postprocess(pool, db, summary)
-                    last_post = time.monotonic()
+
+            def tick():
+                if time.monotonic() - state["last_post"] > POSTPROCESS_EVERY and not state["busy"]:
+                    state["busy"] = True
+                    try:
+                        _postprocess(pool, db, summary)
+                    finally:
+                        state["busy"] = False
+                        state["last_post"] = time.monotonic()
+
+            scan_groups(pool, db, groups, done=done, tick=tick)
             _postprocess(pool, db, summary)
+            pool.close()
+            enricher.stop.set()
+            _enrich_now.set()
+            enricher.join()
+            _set("scanner", state="looking up metadata", group=None)
+            enrich_pending(db)
     except Exception as e:
         summary["errors"].append(f"{type(e).__name__}: {e}")
         raise
     finally:
+        enricher.stop.set()
+        _enrich_now.set()
         pool.close()
         summary["finished"] = _iso(datetime.utcnow())
         summary["seconds"] = round((datetime.utcnow() - t0).total_seconds())
